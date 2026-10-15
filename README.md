@@ -47,6 +47,8 @@ py -3.13 -m app cut                               # спросит ссылку 
 
 `process` и `cut` принимают и ссылку на YouTube, генератор скачает ролик через yt-dlp. Для ссылки имя папки берётся из id ролика.
 
+**Субтитры и заголовок.** При перекодировании в клип вжигаются субтитры из транскрипта генератора (белый жирный шрифт с чёрной обводкой, нижняя треть кадра, не больше двух строк) и заголовок из `result.json` вверху кадра на первые 3 секунды. Выключаются флагами `SUBTITLES` и `HOOK_TITLE` в `app/config.py`. Размер шрифта и отступы лежат в `ASS_HEADER` в `app/__main__.py`.
+
 **Слоты.** `SLOTS` в [app/config.py](app/config.py) — время на каждый день по Владивостоку. Клипу достаётся ближайший слот, который не занят клипом в статусе `uploaded`/`unknown`, начинается не раньше чем через 20 минут (минимум TikTok — 15, плюс 5 минут на саму заливку) и не дальше 10 дней. Нет такого слота — клип ждёт следующего `upload`.
 
 **Статусы.**
@@ -80,11 +82,13 @@ ffmpeg -version                     # проверка
 
 cd tools\shorts-generator
 py -3.13 -m venv .venv
-.\.venv\Scripts\python -m pip install -r requirements-local.txt "av==18.1.0"
+.\.venv\Scripts\python -m pip install -r requirements-local.txt "av==18.1.0" "opencv-python<5"
 copy .env.example .env
 ```
 
-PyAV закреплён на 18.1.0. faster-whisper 1.2.1 (последний на октябрь 2026) открывает видео через `av.open(..., metadata_errors="ignore")`, а в av 19 такого параметра нет, и распознавание падает с `open() got an unexpected keyword argument 'metadata_errors'`. faster-whisper требует только `av>=11`, поэтому без явной версии pip ставит 19. Закрепление можно снять, когда выйдет faster-whisper новее 1.2.1 с исправлением.
+Две версии закреплены вручную, потому что требования генератора не ограничены сверху:
+- PyAV 18.1.0. faster-whisper 1.2.1 (последний на октябрь 2026) открывает видео через `av.open(..., metadata_errors="ignore")`, а в av 19 такого параметра нет, и распознавание падает с `open() got an unexpected keyword argument 'metadata_errors'`. Закрепление можно снять, когда выйдет faster-whisper новее 1.2.1 с исправлением.
+- opencv-python 4.x. В OpenCV 5 нет `cv2.CascadeClassifier`, на котором генератор ищет лица при кадрировании. Клип падает, файл `short_NN.mp4.cut.mp4` остаётся открытым, и в `result.json` вместо настоящей ошибки попадает `WinError 32`.
 
 В `.env` для local-режима достаточно (MUAPI-строки можно удалить):
 
