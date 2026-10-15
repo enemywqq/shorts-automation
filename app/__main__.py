@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -9,11 +10,15 @@ import subprocess
 import sys
 from datetime import datetime, time, timedelta
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from . import config
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(errors="replace")
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(errors="replace")
+
+log = logging.getLogger("app")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS clips (
@@ -42,10 +47,26 @@ def connect() -> sqlite3.Connection:
 # -- process --------------------------------------------------------------------
 
 
+def resolve_source(raw: str) -> "tuple[str, bool] | None":
+    """(абсолютный путь или URL, это файл?) либо None."""
+    if Path(raw).is_file():
+        return str(Path(raw).resolve()), True
+    if raw.startswith(("http://", "https://")):
+        return raw, False
+    log.error("Файл не найден: %s", raw)
+    return None
+
+
+def url_stem(url: str) -> str:
+    """id ролика YouTube (watch?v=, youtu.be/, shorts/) или последний сегмент пути."""
+    parsed = urlparse(url)
+    return parse_qs(parsed.query).get("v", [""])[0] or parsed.path.rstrip("/").rpartition("/")[2]
+
+
 def source_id(source: str, is_file: bool) -> str:
     # Только ASCII: путь к папке уходит в OpenCV, а тот на Windows не всегда
     # открывает файлы с кириллицей.
-    stem = Path(source).stem if is_file else "url"
+    stem = Path(source).stem if is_file else url_stem(source)
     stem = re.sub(r"[^A-Za-z0-9_-]+", "_", stem).strip("_")[:40] or "video"
     return f"{stem}_{hashlib.sha1(source.encode()).hexdigest()[:8]}"
 
@@ -59,22 +80,8 @@ def reencode(src: Path, dst: Path) -> None:
     )
 
 
-def cmd_process(args) -> int:
-    is_file = Path(args.source).is_file()
-    if is_file:
-        source = str(Path(args.source).resolve())
-    elif args.source.startswith(("http://", "https://")):
-        source = args.source
-    else:
-        print(f"Файл не найден: {args.source}", file=sys.stderr)
-        return 1
-
-    db = connect()
-    if db.execute("SELECT 1 FROM clips WHERE source = ?", (source,)).fetchone():
-        print(f"Уже обработан, клипы в очереди: {source}")
-        return 0
-
-    out_dir = config.CLIPS_DIR / source_id(source, is_file)
+def make_clips(source: str, out_dir: Path, num_clips: int) -> "list[tuple[Path, str]] | None":
+    """Генератор и перекодирование в H.264. Список (клип, заголовок) или None, если генератор упал."""
     out_dir.mkdir(parents=True, exist_ok=True)
     # Генератору отдаём путь относительно его cwd: так он остаётся ASCII,
     # даже если в пути к проекту есть кириллица.
@@ -82,35 +89,68 @@ def cmd_process(args) -> int:
     result_json = os.path.join(out_rel, "result.json")
 
     cmd = [str(config.GENERATOR_PYTHON), "main.py", source, "--mode", "local",
-           "--num-clips", str(config.NUM_CLIPS), "--output-json", result_json]
+           "--num-clips", str(num_clips), "--output-json", result_json]
     if config.LANGUAGE:
         cmd += ["--language", config.LANGUAGE]
-    print(f"Генератор → {out_dir}", flush=True)
+    log.info("Генератор: %s", out_dir)
     rc = subprocess.run(cmd, cwd=config.GENERATOR_DIR,
                         env={**os.environ, "LOCAL_OUTPUT_DIR": out_rel}).returncode
     if rc != 0:
-        print(f"Генератор завершился с кодом {rc}", file=sys.stderr)
-        return 1
+        log.error("Генератор завершился с кодом %d", rc)
+        return None
 
     shorts = json.loads((config.GENERATOR_DIR / result_json).read_text(encoding="utf-8"))["shorts"]
-    added = 0
+    clips = []
     for short in shorts:
         if not short.get("clip_url"):
-            print(f"Пропуск (генератор не собрал клип): {short.get('title')} — {short.get('error')}")
+            log.warning("Пропуск, генератор не собрал клип: %s (%s)", short.get("title"), short.get("error"))
             continue
         raw = (config.GENERATOR_DIR / short["clip_url"]).resolve()
         clip = raw.with_name(raw.stem + "_h264.mp4")
         try:
             reencode(raw, clip)
         except subprocess.CalledProcessError as e:
-            print(f"Пропуск (ffmpeg, код {e.returncode}): {raw.name}", file=sys.stderr)
+            log.error("Пропуск, ffmpeg завершился с кодом %d: %s", e.returncode, raw.name)
             continue
         raw.unlink()
-        db.execute("INSERT INTO clips (path, caption, source) VALUES (?, ?, ?)",
-                   (str(clip), short["title"], source))
-        added += 1
+        clips.append((clip, short["title"]))
+    log.info("Готово клипов: %d из %d", len(clips), len(shorts))
+    return clips
+
+
+def cmd_process(args: argparse.Namespace) -> int:
+    resolved = resolve_source(args.source)
+    if resolved is None:
+        return 1
+    source, is_file = resolved
+
+    db = connect()
+    if db.execute("SELECT 1 FROM clips WHERE source = ?", (source,)).fetchone():
+        log.info("Уже обработан, клипы в очереди: %s", source)
+        return 0
+
+    clips = make_clips(source, config.CLIPS_DIR / source_id(source, is_file), config.NUM_CLIPS)
+    if clips is None:
+        return 1
+    db.executemany("INSERT INTO clips (path, caption, source) VALUES (?, ?, ?)",
+                   [(str(path), title, source) for path, title in clips])
     db.commit()
-    print(f"В очередь добавлено клипов: {added} из {len(shorts)}")
+    log.info("В очередь добавлено клипов: %d", len(clips))
+    return 0
+
+
+def cmd_cut(args: argparse.Namespace) -> int:
+    raw = args.source or input("Ссылка или путь к видео: ").strip().strip('"')
+    resolved = resolve_source(raw)
+    if resolved is None:
+        return 1
+    source, is_file = resolved
+
+    out_dir = config.PREVIEW_DIR / source_id(source, is_file)
+    if make_clips(source, out_dir, config.CUT_NUM_CLIPS) is None:
+        return 1
+    if os.name == "nt":
+        os.startfile(out_dir)
     return 0
 
 
@@ -227,12 +267,16 @@ def main() -> int:
     p = sub.add_parser("process", help="нарезать, перекодировать, добавить клипы в очередь")
     p.add_argument("source", help="путь к видео или ссылка")
     p.set_defaults(func=cmd_process)
+    c = sub.add_parser("cut", help="только нарезать в data/preview, без очереди")
+    c.add_argument("source", nargs="?", help="путь к видео или ссылка; без него спросит")
+    c.set_defaults(func=cmd_cut)
     sub.add_parser("upload", help="залить pending-клипы в свободные слоты").set_defaults(func=cmd_upload)
     sub.add_parser("status", help="показать очередь").set_defaults(func=cmd_status)
     r = sub.add_parser("retry", help="вернуть failed/unknown в pending")
     r.add_argument("ids", nargs="+", type=int)
     r.set_defaults(func=cmd_retry)
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     return args.func(args)
 
 

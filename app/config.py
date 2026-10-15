@@ -5,12 +5,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "db.sqlite"
 CLIPS_DIR = ROOT / "data" / "clips"
+PREVIEW_DIR = ROOT / "data" / "preview"
 
 _VENV_PYTHON = Path(".venv", "Scripts", "python.exe") if os.name == "nt" else Path(".venv", "bin", "python")
 
 GENERATOR_DIR = ROOT / "tools" / "shorts-generator"
 GENERATOR_PYTHON = GENERATOR_DIR / _VENV_PYTHON
 NUM_CLIPS = 3
+CUT_NUM_CLIPS = 5  # для cut
 LANGUAGE = "ru"  # None = автоопределение Whisper
 
 UPLOADER_DIR = ROOT / "tools" / "tiktok-uploader"
