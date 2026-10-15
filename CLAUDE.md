@@ -64,6 +64,7 @@ Windows, PowerShell, из корня проекта. Своего venv у орк
 
 ```powershell
 py -3.13 -m app process <путь|URL>   # генератор → перекодирование в H.264 → строки в БД
+py -3.13 -m app cut [<путь|URL>]     # то же в data/preview, без БД; открывает папку; cut.bat вызывает это
 py -3.13 -m app upload               # все pending → свободные слоты → autotok с -sc
 py -3.13 -m app status
 py -3.13 -m app retry <id> [<id>...] # только failed/unknown → pending
