@@ -71,13 +71,91 @@ def source_id(source: str, is_file: bool) -> str:
     return f"{stem}_{hashlib.sha1(source.encode()).hexdigest()[:8]}"
 
 
-def reencode(src: Path, dst: Path) -> None:
-    subprocess.run(
-        [config.FFMPEG, "-y", "-loglevel", "error", "-i", str(src),
-         "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
-         "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(dst)],
-        check=True,
-    )
+Cue = tuple[float, float, str]
+
+# Координаты в кадре 1080x1920, libass масштабирует их под реальный размер клипа.
+ASS_HEADER = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Sub,Arial,80,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,6,0,2,80,80,400,1
+Style: Title,Arial,90,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,7,0,8,80,80,220,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+# Около 21 символа на строку при шрифте 80 и ширине 1080: так кусок не вылезает за две строки.
+SUB_MAX_CHARS = 40
+TITLE_SECONDS = 3.0
+
+
+def read_srt(path: Path) -> list[Cue]:
+    cues = []
+    for block in re.split(r"\n\s*\n", path.read_text(encoding="utf-8-sig")):
+        m = re.search(r"(\d+):(\d+):(\d+),(\d+) --> (\d+):(\d+):(\d+),(\d+)\s*\n(.*)", block, re.S)
+        if m:
+            h1, m1, s1, ms1, h2, m2, s2, ms2 = map(int, m.groups()[:8])
+            cues.append((h1 * 3600 + m1 * 60 + s1 + ms1 / 1000, h2 * 3600 + m2 * 60 + s2 + ms2 / 1000,
+                         " ".join(m.group(9).split())))
+    return cues
+
+
+def split_text(text: str) -> list[str]:
+    parts, cur = [], ""
+    for word in text.split():
+        if cur and len(cur) + 1 + len(word) > SUB_MAX_CHARS:
+            parts.append(cur)
+            cur = word
+        else:
+            cur = f"{cur} {word}".strip()
+    return parts + [cur] if cur else parts
+
+
+def clip_cues(cues: list[Cue], start: float, end: float) -> list[Cue]:
+    """Реплики внутри [start, end], сдвинутые к нулю и порезанные на куски не длиннее двух строк."""
+    out = []
+    for a, b, text in cues:
+        a, b = max(a, start) - start, min(b, end) - start
+        parts = split_text(text)
+        if b <= a or not parts:
+            continue
+        # Время реплики делим между кусками пропорционально длине текста.
+        total, t = sum(map(len, parts)), a
+        for part in parts:
+            dur = (b - a) * len(part) / total
+            out.append((t, t + dur, part))
+            t += dur
+    return out
+
+
+def ass_time(t: float) -> str:
+    cs = round(t * 100)
+    return f"{cs // 360000}:{cs // 6000 % 60:02d}:{cs // 100 % 60:02d}.{cs % 100:02d}"
+
+
+def ass_text(text: str) -> str:
+    return text.replace("\\", "/").replace("{", "(").replace("}", ")").replace("\n", " ")
+
+
+def write_ass(path: Path, cues: list[Cue], title: str) -> None:
+    lines = [f"Dialogue: 0,{ass_time(a)},{ass_time(b)},Sub,,0,0,0,,{ass_text(text)}" for a, b, text in cues]
+    if title:
+        lines.append(f"Dialogue: 1,{ass_time(0)},{ass_time(TITLE_SECONDS)},Title,,0,0,0,,{ass_text(title)}")
+    path.write_text(ASS_HEADER + "\n".join(lines) + "\n", encoding="utf-8")
+
+
+def reencode(src: Path, dst: Path, ass: "Path | None" = None) -> None:
+    cmd = [config.FFMPEG, "-y", "-loglevel", "error", "-i", str(src)]
+    if ass:
+        # Имя без пути и cwd в папке клипа: в фильтрах ffmpeg двоеточие из C:\ надо экранировать.
+        cmd += ["-vf", f"ass={ass.name}"]
+    cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(dst)]
+    subprocess.run(cmd, check=True, cwd=dst.parent)
 
 
 def make_clips(source: str, out_dir: Path, num_clips: int) -> "list[tuple[Path, str]] | None":
@@ -99,7 +177,17 @@ def make_clips(source: str, out_dir: Path, num_clips: int) -> "list[tuple[Path, 
         log.error("Генератор завершился с кодом %d", rc)
         return None
 
-    shorts = json.loads((config.GENERATOR_DIR / result_json).read_text(encoding="utf-8"))["shorts"]
+    result = json.loads((config.GENERATOR_DIR / result_json).read_text(encoding="utf-8"))
+    shorts = result["shorts"]
+    cues = []
+    if config.SUBTITLES:
+        # Генератор кэширует транскрипт исходника как <имя исходника>.srt в папке вывода.
+        srt = out_dir / (Path(result["source_video_url"]).stem + ".srt")
+        if srt.is_file():
+            cues = read_srt(srt)
+        else:
+            log.warning("Нет %s, клипы будут без субтитров", srt.name)
+
     clips = []
     for short in shorts:
         if not short.get("clip_url"):
@@ -107,12 +195,19 @@ def make_clips(source: str, out_dir: Path, num_clips: int) -> "list[tuple[Path, 
             continue
         raw = (config.GENERATOR_DIR / short["clip_url"]).resolve()
         clip = raw.with_name(raw.stem + "_h264.mp4")
+        ass = None
+        if config.SUBTITLES or config.HOOK_TITLE:
+            ass = clip.with_suffix(".ass")
+            write_ass(ass, clip_cues(cues, float(short["start_time"]), float(short["end_time"])),
+                      short["title"] if config.HOOK_TITLE else "")
         try:
-            reencode(raw, clip)
+            reencode(raw, clip, ass)
         except subprocess.CalledProcessError as e:
             log.error("Пропуск, ffmpeg завершился с кодом %d: %s", e.returncode, raw.name)
             continue
         raw.unlink()
+        if ass:
+            ass.unlink()
         clips.append((clip, short["title"]))
     log.info("Готово клипов: %d из %d", len(clips), len(shorts))
     return clips

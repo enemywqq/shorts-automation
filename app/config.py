@@ -20,6 +20,8 @@ UPLOADER_PYTHON = UPLOADER_DIR / _VENV_PYTHON
 TIKTOK_ACCOUNT = "main"  # имя из `cli.py login -n`
 
 FFMPEG = "ffmpeg"
+SUBTITLES = True   # вжигать субтитры из транскрипта генератора
+HOOK_TITLE = True  # заголовок клипа вверху кадра первые 3 секунды
 
 # Слоты публикации, каждый день, по местному времени.
 SLOTS = ["12:00", "19:00"]
