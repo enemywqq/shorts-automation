@@ -80,9 +80,11 @@ ffmpeg -version                     # проверка
 
 cd tools\shorts-generator
 py -3.13 -m venv .venv
-.\.venv\Scripts\python -m pip install -r requirements-local.txt
+.\.venv\Scripts\python -m pip install -r requirements-local.txt "av==18.1.0"
 copy .env.example .env
 ```
+
+PyAV закреплён на 18.1.0. faster-whisper 1.2.1 (последний на октябрь 2026) открывает видео через `av.open(..., metadata_errors="ignore")`, а в av 19 такого параметра нет, и распознавание падает с `open() got an unexpected keyword argument 'metadata_errors'`. faster-whisper требует только `av>=11`, поэтому без явной версии pip ставит 19. Закрепление можно снять, когда выйдет faster-whisper новее 1.2.1 с исправлением.
 
 В `.env` для local-режима достаточно (MUAPI-строки можно удалить):
 
@@ -92,6 +94,7 @@ GEMINI_API_KEY=...                  # или OPENAI_API_KEY=...
 LOCAL_WHISPER_MODEL=small           # base по умолчанию; для русской речи small заметно лучше
 LOCAL_WHISPER_DEVICE=cpu
 LOCAL_OUTPUT_DIR=output
+LOCAL_WHISPER_VAD_FILTER=true       # без него Whisper выдумывает титры на паузах и музыке
 ```
 
 ### Запуск
