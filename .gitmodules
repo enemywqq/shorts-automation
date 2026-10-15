@@ -1,0 +1,8 @@
+[submodule "tools/shorts-generator"]
+	path = tools/shorts-generator
+	url = https://github.com/Anil-matcha/AI-Youtube-Shorts-Generator
+	ignore = dirty
+[submodule "tools/tiktok-uploader"]
+	path = tools/tiktok-uploader
+	url = https://github.com/makiisthenes/TiktokAutoUploader
+	ignore = dirty
