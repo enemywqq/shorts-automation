@@ -12,7 +12,7 @@ index 866b61f..dd5b122 100644
  
      if args.output_json:
 diff --git a/shorts_generator/highlights.py b/shorts_generator/highlights.py
-index 9b9a11f..6ab3647 100644
+index 9b9a11f..c1c68f5 100644
 --- a/shorts_generator/highlights.py
 +++ b/shorts_generator/highlights.py
 @@ -56,6 +56,7 @@ Rules:
@@ -23,6 +23,31 @@ index 9b9a11f..6ab3647 100644
  
  Respond ONLY with valid JSON (no markdown, no explanation):
  {{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
+@@ -189,7 +190,9 @@ def chunk_transcript(transcript: Dict) -> List[Dict]:
+         ]
+         if chunk_segs:
+             chunk = dict(transcript)
+-            chunk["segments"] = chunk_segs
++            # Время в куске от его начала: ответ модели обрезается по длине куска, а потом к нему
++            # прибавляется смещение. С абсолютным временем с третьего куска моменты отбраковывались.
++            chunk["segments"] = [{**s, "start": s["start"] - start, "end": s["end"] - start} for s in chunk_segs]
+             chunk["duration"] = end - start
+             chunk["_offset"] = start
+             chunks.append(chunk)
+@@ -292,7 +295,12 @@ def get_highlights(
+             offset = chunk.get("_offset", 0)
+             text = build_transcript_text(chunk)
+             print(f"[highlights] chunk {i + 1}/{len(chunks)} (offset {offset:.0f}s)", flush=True)
+-            result = call_highlight_api(text, content_info, chunk["duration"], num_clips=num_clips, is_chunk=True, llm_fn=llm_fn)
++            # Один сломанный кусок не должен ронять разбор многочасового видео.
++            try:
++                result = call_highlight_api(text, content_info, chunk["duration"], num_clips=num_clips, is_chunk=True, llm_fn=llm_fn)
++            except Exception as e:
++                print(f"[highlights] chunk {i + 1}/{len(chunks)} skipped: {e}", flush=True)
++                continue
+             for h in result.get("highlights", []):
+                 h["start_time"] = float(h["start_time"]) + offset
+                 h["end_time"] = float(h["end_time"]) + offset
 diff --git a/shorts_generator/local/clipper.py b/shorts_generator/local/clipper.py
 index 931f99c..ae1b0fc 100644
 --- a/shorts_generator/local/clipper.py
