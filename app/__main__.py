@@ -287,8 +287,14 @@ def pick_layout(samples: list, size: list[float]) -> tuple[str, dict, str]:
     if share >= config.AUTO_MIN_SHARE and h >= config.AUTO_BIG_FACE and abs(cx - 0.5) <= config.AUTO_CENTER:
         return "face", {"cx": track_expr(samples)}, (f"крупное лицо (высота {h:.2f}, x {cx:.2f}) "
                                                      f"в {share:.0%} замеров")
-    return "fit", {}, (f"крупнейшее лицо в {share:.0%} замеров, высота {h:.2f}, x {cx:.2f}: "
-                       f"не крупное у центра и не вебка у края")
+    # IRL в движении: человек ходит, медиана размера и места ничего не говорит, поэтому
+    # считаем замеры, где лицо заметное и не у края.
+    walking = sum(f[3] >= config.AUTO_SMALL_FACE and abs(f[0] - 0.5) < config.AUTO_EDGE for f in biggest) / n
+    if walking >= config.AUTO_IRL_SHARE:
+        return "face", {"cx": track_expr(samples)}, (f"лицо двигается, но в {walking:.0%} замеров "
+                                                     f"заметное и не у края")
+    return "fit", {}, (f"крупнейшее лицо в {share:.0%} замеров, высота {h:.2f}, x {cx:.2f}, "
+                       f"заметное и не у края только в {walking:.0%}: не вебка и не IRL")
 
 
 def detect_faces(video: Path, spans: list[tuple[float, float]]) -> "dict | None":
