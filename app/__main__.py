@@ -4,10 +4,13 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
 import sqlite3
 import subprocess
 import sys
+import threading
+import time as clock
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -158,6 +161,61 @@ def reencode(src: Path, dst: Path, ass: "Path | None" = None) -> None:
     subprocess.run(cmd, check=True, cwd=dst.parent)
 
 
+# Этап генератора и строка его вывода, на которой этап заканчивается. Последний длится до выхода.
+GENERATOR_STAGES = [
+    ("подготовка", "[transcribe/local]"),
+    ("транскрипция", " segments, "),
+    ("выбор моментов", "[pipeline/local] cropping"),
+    ("кадрирование", None),
+]
+HEARTBEAT_SECONDS = 60
+
+
+def duration(seconds: float) -> str:
+    return str(timedelta(seconds=round(seconds)))
+
+
+def pump(stream, lines: queue.Queue) -> None:
+    for line in stream:
+        lines.put(line.rstrip())
+    lines.put(None)
+
+
+def run_generator(cmd: list[str], env: dict) -> "dict[str, float] | None":
+    """Гонит генератор, пересылая его вывод в лог. Время этапов или None, если генератор упал."""
+    proc = subprocess.Popen(cmd, cwd=config.GENERATOR_DIR, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+    lines = queue.Queue()
+    threading.Thread(target=pump, args=(proc.stdout, lines), daemon=True).start()
+    timings, stage, started = {}, 0, clock.monotonic()
+    while True:
+        name, end_marker = GENERATOR_STAGES[stage]
+        if name == "выбор моментов" and clock.monotonic() - started > config.HIGHLIGHTS_TIMEOUT.total_seconds():
+            proc.kill()
+            proc.wait()
+            log.error("Выбор моментов идёт дольше %s, генератор остановлен. Скорее всего, завис "
+                      "запрос к Gemini: google-genai ждёт ответа без таймаута", config.HIGHLIGHTS_TIMEOUT)
+            return None
+        try:
+            line = lines.get(timeout=HEARTBEAT_SECONDS)
+        except queue.Empty:
+            log.info("... %s идёт %s", name, duration(clock.monotonic() - started))
+            continue
+        if line is None:
+            break
+        log.info("  %s", line)
+        if end_marker and end_marker in line:
+            timings[name] = clock.monotonic() - started
+            log.info("Этап «%s»: %s", name, duration(timings[name]))
+            stage, started = stage + 1, clock.monotonic()
+    timings[name] = clock.monotonic() - started
+    rc = proc.wait()
+    if rc != 0:
+        log.error("Генератор завершился с кодом %d", rc)
+        return None
+    return timings
+
+
 def make_clips(source: str, out_dir: Path, num_clips: int) -> "list[tuple[Path, str]] | None":
     """Генератор и перекодирование в H.264. Список (клип, заголовок) или None, если генератор упал."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -171,10 +229,10 @@ def make_clips(source: str, out_dir: Path, num_clips: int) -> "list[tuple[Path, 
     if config.LANGUAGE:
         cmd += ["--language", config.LANGUAGE]
     log.info("Генератор: %s", out_dir)
-    rc = subprocess.run(cmd, cwd=config.GENERATOR_DIR,
-                        env={**os.environ, "LOCAL_OUTPUT_DIR": out_rel}).returncode
-    if rc != 0:
-        log.error("Генератор завершился с кодом %d", rc)
+    # Без PYTHONUTF8 вывод генератора в pipe идёт в cp1251, и print заголовка с эмодзи роняет его.
+    timings = run_generator(cmd, {**os.environ, "LOCAL_OUTPUT_DIR": out_rel,
+                                  "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"})
+    if timings is None:
         return None
 
     result = json.loads((config.GENERATOR_DIR / result_json).read_text(encoding="utf-8"))
@@ -189,7 +247,8 @@ def make_clips(source: str, out_dir: Path, num_clips: int) -> "list[tuple[Path, 
             log.warning("Нет %s, клипы будут без субтитров", srt.name)
 
     clips = []
-    for short in shorts:
+    started = clock.monotonic()
+    for i, short in enumerate(shorts, 1):
         if not short.get("clip_url"):
             log.warning("Пропуск, генератор не собрал клип: %s (%s)", short.get("title"), short.get("error"))
             continue
@@ -200,6 +259,7 @@ def make_clips(source: str, out_dir: Path, num_clips: int) -> "list[tuple[Path, 
             ass = clip.with_suffix(".ass")
             write_ass(ass, clip_cues(cues, float(short["start_time"]), float(short["end_time"])),
                       short["title"] if config.HOOK_TITLE else "")
+        log.info("Перекодирование %d/%d: %s", i, len(shorts), clip.name)
         try:
             reencode(raw, clip, ass)
         except subprocess.CalledProcessError as e:
@@ -209,7 +269,10 @@ def make_clips(source: str, out_dir: Path, num_clips: int) -> "list[tuple[Path, 
         if ass:
             ass.unlink()
         clips.append((clip, short["title"]))
+    timings["перекодирование"] = clock.monotonic() - started
     log.info("Готово клипов: %d из %d", len(clips), len(shorts))
+    log.info("Время: %s, всего %s", ", ".join(f"{k} {duration(v)}" for k, v in timings.items()),
+             duration(sum(timings.values())))
     return clips
 
 
