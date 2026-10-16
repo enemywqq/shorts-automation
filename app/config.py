@@ -11,11 +11,11 @@ _VENV_PYTHON = Path(".venv", "Scripts", "python.exe") if os.name == "nt" else Pa
 
 GENERATOR_DIR = ROOT / "tools" / "shorts-generator"
 GENERATOR_PYTHON = GENERATOR_DIR / _VENV_PYTHON
-# Клипов с исходника: один на CLIP_EVERY_MINUTES минут, не меньше CLIPS_MIN и не больше CLIPS_MAX.
-# Генератор даёт до 8 кандидатов на 20 минут, из них берём лучшие ~2. CLIPS_MAX = 2 слота в день
-# на 10 дней вперёд (MAX_LEAD): больше за один upload в расписание не встанет.
-CLIP_EVERY_MINUTES = 10
-CLIPS_MIN = 3
+# Клипы: все кандидаты генератора со score от CLIP_MIN_SCORE, но не меньше CLIPS_MIN лучших и не
+# больше CLIPS_MAX. Модель ставит оценки в узком диапазоне (по 52 кандидатам 78-96, половина в
+# 85-89), 90 и выше это верхние ~40%. CLIPS_MAX = 2 слота в день на 10 дней вперёд (MAX_LEAD).
+CLIP_MIN_SCORE = 90
+CLIPS_MIN = 2
 CLIPS_MAX = 20
 LANGUAGE = "ru"  # None = автоопределение Whisper
 # Страховка от зависшего Gemini: выбор моментов дольше HIGHLIGHTS_TIMEOUT плюс

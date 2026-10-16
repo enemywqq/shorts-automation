@@ -395,9 +395,11 @@ def run_generator(cmd: list[str], env: dict) -> "dict[str, float] | None":
     return timings
 
 
-def clip_count(seconds: float) -> int:
-    """Сколько клипов брать с исходника такой длины."""
-    return max(config.CLIPS_MIN, min(config.CLIPS_MAX, round(seconds / 60 / config.CLIP_EVERY_MINUTES)))
+def pick_moments(highlights: list[dict]) -> list[dict]:
+    """Моменты со score от CLIP_MIN_SCORE, по убыванию score, не меньше CLIPS_MIN и не больше CLIPS_MAX."""
+    ranked = sorted(highlights, key=lambda h: int(h.get("score", 0)), reverse=True)
+    good = sum(int(h.get("score", 0)) >= config.CLIP_MIN_SCORE for h in ranked)
+    return ranked[:max(config.CLIPS_MIN, min(config.CLIPS_MAX, good))]
 
 
 def make_clips(source: str, out_dir: Path, layout: str) -> "list[tuple[Path, str]] | None":
@@ -409,8 +411,8 @@ def make_clips(source: str, out_dir: Path, layout: str) -> "list[tuple[Path, str
     result_json = os.path.join(out_rel, "result.json")
 
     cmd = [str(config.GENERATOR_PYTHON), "main.py", source, "--mode", "local",
-           # Длина видео станет известна только после транскрипции, поэтому просим максимум
-           # и обрезаем по clip_count: shorts у генератора уже отсортированы по score.
+           # Клипы берём из всех кандидатов (highlights), а не из его shorts. Большое --num-clips
+           # нужно только затем, чтобы промпт просил у модели больше кандидатов.
            "--num-clips", str(config.CLIPS_MAX), "--output-json", result_json]
     if config.LANGUAGE:
         cmd += ["--language", config.LANGUAGE]
@@ -423,9 +425,10 @@ def make_clips(source: str, out_dir: Path, layout: str) -> "list[tuple[Path, str
         return None
 
     result = json.loads((config.GENERATOR_DIR / result_json).read_text(encoding="utf-8"))
-    seconds = float(result["transcript"]["duration"])
-    shorts = result["shorts"][:clip_count(seconds)]
-    log.info("Исходник %s: клипов %d из %d найденных", duration(seconds), len(shorts), len(result["shorts"]))
+    shorts = pick_moments(result["highlights"])
+    log.info("Кандидатов %d, score: %s. Клипов %d (порог %d, от %d до %d)", len(result["highlights"]),
+             " ".join(str(h.get("score")) for h in sorted(result["highlights"], key=lambda h: -int(h.get("score", 0)))),
+             len(shorts), config.CLIP_MIN_SCORE, config.CLIPS_MIN, config.CLIPS_MAX)
     video = (config.GENERATOR_DIR / result["source_video_url"]).resolve()
     # Генератор кэширует транскрипт исходника как <имя исходника>.srt в папке вывода.
     srt = out_dir / (video.stem + ".srt")
