@@ -144,20 +144,51 @@ def ass_text(text: str) -> str:
     return text.replace("\\", "/").replace("{", "(").replace("}", ")").replace("\n", " ")
 
 
-def write_ass(path: Path, cues: list[Cue], title: str) -> None:
-    lines = [f"Dialogue: 0,{ass_time(a)},{ass_time(b)},Sub,,0,0,0,,{ass_text(text)}" for a, b, text in cues]
+def write_ass(path: Path, cues: list[Cue], title: str, sub_pos: str) -> None:
+    lines = [f"Dialogue: 0,{ass_time(a)},{ass_time(b)},Sub,,0,0,0,,{sub_pos}{ass_text(text)}"
+             for a, b, text in cues]
     if title:
         lines.append(f"Dialogue: 1,{ass_time(0)},{ass_time(TITLE_SECONDS)},Title,,0,0,0,,{ass_text(title)}")
     path.write_text(ASS_HEADER + "\n".join(lines) + "\n", encoding="utf-8")
 
 
-def reencode(src: Path, dst: Path, ass: "Path | None" = None) -> None:
-    cmd = [config.FFMPEG, "-y", "-loglevel", "error", "-i", str(src)]
+def snap(cues: list[Cue], start: float, end: float) -> tuple[float, float]:
+    """Двигает границы клипа к началу и концу реплик, которые они разрезают, и добавляет запас."""
+    for a, b, _ in cues:
+        if a < start < b:
+            start = a
+        if a < end < b:
+            end = b
+    return max(0.0, start - config.SNAP_PAD), end + config.SNAP_PAD
+
+
+# Видеофильтры макетов: вход [0:v], кадр 1080x1920. В split вебка 1080x768 сверху, экран 1080x1152 снизу.
+# ponytail: fit и позиция субтитров в нём рассчитаны на горизонтальный исходник 16:9.
+LAYOUTS = {
+    # Фон размываем на копии 270x480: boxblur на полном кадре в разы медленнее.
+    "fit": "[0:v]split[a][b];[a]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,"
+           "boxblur=10:2,scale=1080:1920[bg];[b]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2",
+    "split": "[0:v]split[a][b];[a]crop=iw*{w}:ih*{h}:iw*{x}:ih*{y},"
+             "scale=1080:768:force_original_aspect_ratio=increase,crop=1080:768[cam];"
+             # Экран чуть приближен: при полной высоте в кадр попадал край вебки.
+             "[b]crop=ih*0.9*1080/1152:ih*0.9,scale=1080:1152[scr];[cam][scr]vstack",
+    "crop": "[0:v]scale=-2:1920,crop=1080:1920",
+}
+# Тег позиции субтитров. В fit картинка 16:9 кончается на y=1264, ниже размытая полоса.
+SUB_POS = {"fit": r"{\an8\pos(540,1300)}", "split": r"{\an5\pos(540,768)}", "crop": ""}
+
+
+def render(video: Path, start: float, end: float, dst: Path, layout: str,
+           cam: "tuple | None", ass: "Path | None") -> None:
+    graph = LAYOUTS[layout].format(**dict(zip("xywh", cam or ()))) + ",setsar=1"
     if ass:
         # Имя без пути и cwd в папке клипа: в фильтрах ffmpeg двоеточие из C:\ надо экранировать.
-        cmd += ["-vf", f"ass={ass.name}"]
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(dst)]
+        graph += f",ass={ass.name}"
+    cmd = [config.FFMPEG, "-y", "-loglevel", "error", "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
+           "-i", str(video), "-filter_complex", graph + "[v]", "-map", "[v]", "-map", "0:a?",
+           "-af", f"loudnorm=I={config.LOUDNESS}:TP=-1.5:LRA=11", "-ar", "48000",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(dst)]
     subprocess.run(cmd, check=True, cwd=dst.parent)
 
 
@@ -165,8 +196,7 @@ def reencode(src: Path, dst: Path, ass: "Path | None" = None) -> None:
 GENERATOR_STAGES = [
     ("подготовка", "[transcribe/local]"),
     ("транскрипция", " segments, "),
-    ("выбор моментов", "[pipeline/local] cropping"),
-    ("кадрирование", None),
+    ("выбор моментов", None),
 ]
 HEARTBEAT_SECONDS = 60
 
@@ -216,8 +246,9 @@ def run_generator(cmd: list[str], env: dict) -> "dict[str, float] | None":
     return timings
 
 
-def make_clips(source: str, out_dir: Path, num_clips: int) -> "list[tuple[Path, str]] | None":
-    """Генератор и перекодирование в H.264. Список (клип, заголовок) или None, если генератор упал."""
+def make_clips(source: str, out_dir: Path, num_clips: int, layout: str,
+               cam: "tuple | None") -> "list[tuple[Path, str]] | None":
+    """Генератор выбирает моменты, ffmpeg монтирует клипы. Список (клип, заголовок) или None."""
     out_dir.mkdir(parents=True, exist_ok=True)
     # Генератору отдаём путь относительно его cwd: так он остаётся ASCII,
     # даже если в пути к проекту есть кириллица.
@@ -230,46 +261,42 @@ def make_clips(source: str, out_dir: Path, num_clips: int) -> "list[tuple[Path, 
         cmd += ["--language", config.LANGUAGE]
     log.info("Генератор: %s", out_dir)
     # Без PYTHONUTF8 вывод генератора в pipe идёт в cp1251, и print заголовка с эмодзи роняет его.
-    timings = run_generator(cmd, {**os.environ, "LOCAL_OUTPUT_DIR": out_rel,
+    # LOCAL_SKIP_CROP понимает только патч генератора: без него он ещё и кадрирует сам.
+    timings = run_generator(cmd, {**os.environ, "LOCAL_OUTPUT_DIR": out_rel, "LOCAL_SKIP_CROP": "true",
                                   "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"})
     if timings is None:
         return None
 
     result = json.loads((config.GENERATOR_DIR / result_json).read_text(encoding="utf-8"))
     shorts = result["shorts"]
-    cues = []
-    if config.SUBTITLES:
-        # Генератор кэширует транскрипт исходника как <имя исходника>.srt в папке вывода.
-        srt = out_dir / (Path(result["source_video_url"]).stem + ".srt")
-        if srt.is_file():
-            cues = read_srt(srt)
-        else:
-            log.warning("Нет %s, клипы будут без субтитров", srt.name)
+    video = (config.GENERATOR_DIR / result["source_video_url"]).resolve()
+    # Генератор кэширует транскрипт исходника как <имя исходника>.srt в папке вывода.
+    srt = out_dir / (video.stem + ".srt")
+    cues = read_srt(srt) if srt.is_file() else []
+    if not cues:
+        log.warning("Нет %s: клипы будут без субтитров и без подгонки к репликам", srt.name)
 
     clips = []
     started = clock.monotonic()
     for i, short in enumerate(shorts, 1):
-        if not short.get("clip_url"):
-            log.warning("Пропуск, генератор не собрал клип: %s (%s)", short.get("title"), short.get("error"))
-            continue
-        raw = (config.GENERATOR_DIR / short["clip_url"]).resolve()
-        clip = raw.with_name(raw.stem + "_h264.mp4")
+        start, end = snap(cues, float(short["start_time"]), float(short["end_time"]))
+        clip = out_dir / f"short_{i:02d}.mp4"
         ass = None
         if config.SUBTITLES or config.HOOK_TITLE:
             ass = clip.with_suffix(".ass")
-            write_ass(ass, clip_cues(cues, float(short["start_time"]), float(short["end_time"])),
-                      short["title"] if config.HOOK_TITLE else "")
-        log.info("Перекодирование %d/%d: %s", i, len(shorts), clip.name)
+            write_ass(ass, clip_cues(cues, start, end) if config.SUBTITLES else [],
+                      short["title"] if config.HOOK_TITLE else "", SUB_POS[layout])
+        log.info("Монтаж %d/%d: %s, с %.1f по %.1f с", i, len(shorts), clip.name, start, end)
         try:
-            reencode(raw, clip, ass)
+            render(video, start, end, clip, layout, cam, ass)
         except subprocess.CalledProcessError as e:
-            log.error("Пропуск, ffmpeg завершился с кодом %d: %s", e.returncode, raw.name)
+            log.error("Пропуск, ffmpeg завершился с кодом %d: %s", e.returncode, clip.name)
             continue
-        raw.unlink()
-        if ass:
-            ass.unlink()
+        finally:
+            if ass:
+                ass.unlink(missing_ok=True)
         clips.append((clip, short["title"]))
-    timings["перекодирование"] = clock.monotonic() - started
+    timings["монтаж"] = clock.monotonic() - started
     log.info("Готово клипов: %d из %d", len(clips), len(shorts))
     log.info("Время: %s, всего %s", ", ".join(f"{k} {duration(v)}" for k, v in timings.items()),
              duration(sum(timings.values())))
@@ -287,7 +314,8 @@ def cmd_process(args: argparse.Namespace) -> int:
         log.info("Уже обработан, клипы в очереди: %s", source)
         return 0
 
-    clips = make_clips(source, config.CLIPS_DIR / source_id(source, is_file), config.NUM_CLIPS)
+    clips = make_clips(source, config.CLIPS_DIR / source_id(source, is_file), config.NUM_CLIPS,
+                       args.layout, config.CAM_PRESETS.get(args.cam))
     if clips is None:
         return 1
     db.executemany("INSERT INTO clips (path, caption, source) VALUES (?, ?, ?)",
@@ -297,15 +325,35 @@ def cmd_process(args: argparse.Namespace) -> int:
     return 0
 
 
+def ask_layout() -> "tuple[str, str] | None":
+    """Спрашивает макет и пресет вебки. Вопросы здесь, а не в cut.bat: cmd ломает UTF-8 bat с кириллицей."""
+    layout = {"2": "split", "3": "crop"}.get(input(
+        "Макет: 1 fit (весь кадр на размытом фоне), 2 split (вебка сверху, экран снизу), "
+        "3 crop (обрезка по центру)\nНомер [1]: ").strip(), "fit")
+    if layout != "split":
+        return layout, None
+    presets = list(config.CAM_PRESETS)
+    cam = input(f"Пресет вебки ({', '.join(presets)}) [{presets[0]}]: ").strip() or presets[0]
+    if cam not in config.CAM_PRESETS:
+        log.error("Нет пресета %s, есть: %s", cam, ", ".join(presets))
+        return None
+    return layout, cam
+
+
 def cmd_cut(args: argparse.Namespace) -> int:
     raw = args.source or input("Ссылка или путь к видео: ").strip().strip('"')
     resolved = resolve_source(raw)
     if resolved is None:
         return 1
     source, is_file = resolved
+    if args.ask:
+        answer = ask_layout()
+        if answer is None:
+            return 1
+        args.layout, args.cam = answer
 
     out_dir = config.PREVIEW_DIR / source_id(source, is_file)
-    if make_clips(source, out_dir, config.CUT_NUM_CLIPS) is None:
+    if make_clips(source, out_dir, config.CUT_NUM_CLIPS, args.layout, config.CAM_PRESETS.get(args.cam)) is None:
         return 1
     if os.name == "nt":
         os.startfile(out_dir)
@@ -422,18 +470,25 @@ def cmd_retry(args) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(prog="python -m app")
     sub = parser.add_subparsers(dest="command", required=True)
-    p = sub.add_parser("process", help="нарезать, перекодировать, добавить клипы в очередь")
+    p = sub.add_parser("process", help="нарезать, смонтировать, добавить клипы в очередь")
     p.add_argument("source", help="путь к видео или ссылка")
     p.set_defaults(func=cmd_process)
     c = sub.add_parser("cut", help="только нарезать в data/preview, без очереди")
     c.add_argument("source", nargs="?", help="путь к видео или ссылка; без него спросит")
+    c.add_argument("--ask", action="store_true", help="спросить макет и пресет вебки (для cut.bat)")
     c.set_defaults(func=cmd_cut)
+    for s in (p, c):
+        s.add_argument("--layout", choices=list(LAYOUTS), default=config.LAYOUT,
+                       help=f"макет клипа (по умолчанию {config.LAYOUT})")
+        s.add_argument("--cam", choices=list(config.CAM_PRESETS), help="пресет вебки для split")
     sub.add_parser("upload", help="залить pending-клипы в свободные слоты").set_defaults(func=cmd_upload)
     sub.add_parser("status", help="показать очередь").set_defaults(func=cmd_status)
     r = sub.add_parser("retry", help="вернуть failed/unknown в pending")
     r.add_argument("ids", nargs="+", type=int)
     r.set_defaults(func=cmd_retry)
     args = parser.parse_args()
+    if getattr(args, "layout", None) == "split" and not args.cam:
+        parser.error(f"для --layout split нужен --cam, пресеты: {', '.join(config.CAM_PRESETS)}")
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     return args.func(args)
 
