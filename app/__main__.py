@@ -420,6 +420,7 @@ def make_clips(source: str, out_dir: Path, layout: str) -> "list[tuple[Path, str
     # Без PYTHONUTF8 вывод генератора в pipe идёт в cp1251, и print заголовка с эмодзи роняет его.
     # LOCAL_SKIP_CROP понимает только патч генератора: без него он ещё и кадрирует сам.
     timings = run_generator(cmd, {**os.environ, "LOCAL_OUTPUT_DIR": out_rel, "LOCAL_SKIP_CROP": "true",
+                                  "HIGHLIGHTS_PROMPT_FILE": str(config.HIGHLIGHTS_PROMPT),
                                   "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"})
     if timings is None:
         return None
