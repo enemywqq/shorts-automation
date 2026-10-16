@@ -3,8 +3,8 @@
 Запускается python из venv генератора, потому что там уже есть OpenCV; в оркестратор
 этот модуль не импортируется. Аргументы: модель YuNet, видео, JSON
 {"spans": [[start, end], ...], "step": секунды, "score": порог уверенности, "ffmpeg": путь}.
-Для crop ещё "crops": рамка без чёрных полос w:h:x:y (или null) на каждый клип и "scene": порог
-scene detection ffmpeg.
+Необязательные "crops": рамка без чёрных полос w:h:x:y (или null) на каждый клип и "scene": порог
+scene detection ffmpeg для слежения.
 В stdout JSON {"size": [ширина, высота], "clips": [...]}: на каждый клип список
 замеров [t, [[cx, cy, w, h, motion], ...]], t от начала клипа, рамки лиц в долях кадра
 (после обрезки полос). motion: средняя разница яркости (0..255) в рамке лица с прошлым
@@ -32,9 +32,10 @@ def ffmpeg_cmd(opts: dict, video: str, start: float, end: float, crop: "str | No
     raw = ["-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
     if "scene" not in opts:
         return cmd + ["-v", "error", "-vf", f"{pick}fps=1/{opts['step']},scale={w}:{h}", *raw]
-    # metadata=print пишет время выбранных кадров в stderr на уровне info.
+    # metadata=print пишет время выбранных кадров в stderr на уровне info. Первый кадр select
+    # пропускает всегда: без единого кадра выход null падает, а в клипе может не быть склеек.
     graph = (f"[0:v]{pick}split[a][b];[a]fps=1/{opts['step']},scale={w}:{h}[f];"
-             f"[b]scale=320:-2,select='gt(scene,{opts['scene']})',metadata=print[s]")
+             f"[b]scale=320:-2,select='gt(scene,{opts['scene']})+eq(n,0)',metadata=print[s]")
     return cmd + ["-v", "info", "-filter_complex", graph, "-map", "[f]", *raw, "-map", "[s]", "-f", "null", "-"]
 
 
@@ -77,7 +78,7 @@ def main() -> None:
                 samples.append([round(i * opts["step"], 2), boxes])
                 prev = gray
             err.seek(0)
-            cuts.append([float(t) for t in re.findall(rb"pts_time:(\d+(?:\.\d+)?)", err.read())])
+            cuts.append([float(t) for t in re.findall(rb"pts_time:(\d+(?:\.\d+)?)", err.read()) if float(t) > 0])
         result.append(samples)
     print(json.dumps({"size": [src_w, src_h], "clips": result, **({"cuts": cuts} if "scene" in opts else {})}))
 

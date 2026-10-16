@@ -249,27 +249,9 @@ def cam_rect(face: list[float], size: list[float]) -> dict:
     return {"x": round(x, 4), "y": round(y, 4), "w": round(w, 4), "h": round(h, 4)}
 
 
-def track_expr(samples: list) -> str:
-    """Выражение ffmpeg от t: сглаженный центр крупнейшего лица по x, линейно между замерами."""
-    xs, last = [], None
-    for _, boxes in samples:
-        if boxes:
-            last = max(boxes, key=lambda f: f[3])[0]
-        xs.append(last)
-    first = next(x for x in xs if x is not None)
-    xs = [first if x is None else x for x in xs]
-    k = config.AUTO_SMOOTH // 2
-    xs = [sum(xs[max(0, i - k):i + k + 1]) / len(xs[max(0, i - k):i + k + 1]) for i in range(len(xs))]
-    ts = [t for t, _ in samples]
-    expr = f"{xs[-1]:.4f}"
-    for i in range(len(xs) - 2, -1, -1):
-        expr = (f"if(lt(t,{ts[i + 1]}),{xs[i]:.4f}+({xs[i + 1] - xs[i]:.4f})*(t-{ts[i]})"
-                f"/{ts[i + 1] - ts[i]:.2f},{expr})")
-    return expr
-
-
 def pick_layout(samples: list, size: list[float]) -> tuple[str, dict, str]:
-    """(раскладка, поля фильтра, причина для лога) по замерам лиц одного клипа."""
+    """(раскладка, поля фильтра, причина для лога) по замерам лиц одного клипа. Выражение слежения
+    для face подставляет потом track_faces."""
     faces = [(t, f) for t, boxes in samples for f in boxes]
     if not faces:
         return "fit", {}, "лиц нет"
@@ -301,14 +283,12 @@ def pick_layout(samples: list, size: list[float]) -> tuple[str, dict, str]:
     biggest = [max(boxes, key=lambda f: f[3]) for _, boxes in samples if boxes]
     h, cx, share = median(f[3] for f in biggest), median(f[0] for f in biggest), len(biggest) / n
     if share >= config.AUTO_MIN_SHARE and h >= config.AUTO_BIG_FACE and abs(cx - 0.5) <= config.AUTO_CENTER:
-        return "face", {"cx": track_expr(samples)}, (f"крупное лицо (высота {h:.2f}, x {cx:.2f}) "
-                                                     f"в {share:.0%} замеров")
+        return "face", {}, f"крупное лицо (высота {h:.2f}, x {cx:.2f}) в {share:.0%} замеров"
     # IRL в движении: человек ходит, медиана размера и места ничего не говорит, поэтому
     # считаем замеры, где лицо заметное и не у края.
     walking = sum(f[3] >= config.AUTO_SMALL_FACE and abs(f[0] - 0.5) < config.AUTO_EDGE for f in biggest) / n
     if walking >= config.AUTO_IRL_SHARE:
-        return "face", {"cx": track_expr(samples)}, (f"лицо двигается, но в {walking:.0%} замеров "
-                                                     f"заметное и не у края")
+        return "face", {}, f"лицо двигается, но в {walking:.0%} замеров заметное и не у края"
     return "fit", {}, (f"крупнейшее лицо в {share:.0%} замеров, высота {h:.2f}, x {cx:.2f}, "
                        f"заметное и не у края только в {walking:.0%}: не вебка и не IRL")
 
@@ -414,10 +394,19 @@ def on_line(points: list[tuple[float, float]]) -> bool:
     return all(abs(xa + (xb - xa) * (t - ta) / (tb - ta) - x) <= KNOT_TOL for t, x in points[1:-1])
 
 
+def bisect_expr(segs: list[tuple[float, str]]) -> str:
+    """if по времени двоичным поиском: отрезок segs[i] действует с segs[i][0] до начала следующего.
+    eval в ffmpeg не разбирает цепочку глубже ~90 узлов, ни вложенных if подряд, ни длинной суммы,
+    а у дерева глубина log2 от числа отрезков."""
+    if len(segs) == 1:
+        return segs[0][1]
+    mid = len(segs) // 2
+    return f"if(lt(t,{segs[mid][0]}),{bisect_expr(segs[:mid])},{bisect_expr(segs[mid:])})"
+
+
 def knots_expr(knots: list[tuple[float, float]]) -> str:
-    """Кусочно-линейное выражение ffmpeg от t по точкам (t, x). Две точки в одно время дают скачок.
-    Сумма отрезков, потому что вложенные if eval в ffmpeg разбирает только до глубины около 90."""
-    # Точки, через которые ломаная и так проходит, выкидываем: ffmpeg считает всю сумму на каждом кадре.
+    """Кусочно-линейное выражение ffmpeg от t по точкам (t, x). Две точки в одно время дают скачок."""
+    # Точки, через которые ломаная и так проходит, выкидываем: выражение короче.
     keep, i = [knots[0]], 0
     while i < len(knots) - 1:
         j = i + 1
@@ -426,12 +415,9 @@ def knots_expr(knots: list[tuple[float, float]]) -> str:
         keep.append(knots[j])
         i = j
     keep = [(round(t, 3), round(x, 4)) for t, x in keep]
-    terms = []
-    for (t0, x0), (t1, x1) in zip(keep, keep[1:]):
-        if t1 - t0 >= 0.001:
-            seg = f"{x0}" if x0 == x1 else f"({x0}+{(x1 - x0) / (t1 - t0):.5f}*(t-{t0}))"
-            terms.append(f"gte(t,{t0})*lt(t,{t1})*{seg}")
-    return "+".join(terms + [f"gte(t,{keep[-1][0]})*{keep[-1][1]}"])
+    segs = [(t0, f"{x0}" if x0 == x1 else f"{x0}+{(x1 - x0) / (t1 - t0):.5f}*(t-{t0})")
+            for (t0, x0), (t1, x1) in zip(keep, keep[1:]) if t1 - t0 >= 0.001]
+    return bisect_expr(segs + [(keep[-1][0], f"{keep[-1][1]}")])
 
 
 def crop_track(samples: list, cuts: list[float], size: list[float], length: float) -> tuple[str, int, int]:
@@ -459,33 +445,61 @@ def crop_track(samples: list, cuts: list[float], size: list[float], length: floa
     return knots_expr(knots), len(parts), tracked
 
 
-def cropdetect(video: Path, t: float) -> subprocess.CompletedProcess:
-    return subprocess.run([config.FFMPEG, "-hide_banner", "-nostats", "-ss", f"{t:.3f}", "-i", str(video),
-                           "-vf", "cropdetect=round=2", "-frames:v", "5", "-f", "null", "-"],
-                          capture_output=True, text=True, encoding="utf-8", errors="replace")
+def bar_rows(video: Path, t: float) -> "tuple[int, int, int, int] | None":
+    """(ширина, высота, строк полосы сверху, строк снизу) кадра в момент t или None. Строка полосы та,
+    где ни один пиксель не ярче BARS_BLACK. cropdetect смотрит среднюю яркость строки, и у него за
+    полосу сходит тёмный край комнаты или ночной игры. Берётся первый ключевой кадр после t в один
+    поток: точная перемотка на 1080p60 декодировала до секунды на кадр, а параллельные декодеры дрались
+    за ядра. После последнего ключевого кадра файла такого нет, тогда обычная перемотка."""
+    for fast in (["-skip_frame", "nokey"], []):
+        proc = subprocess.run([config.FFMPEG, "-v", "error", *fast, "-threads", "1", "-ss", f"{t:.3f}",
+                               "-i", str(video), "-frames:v", "1", "-vf", "format=gray", "-c:v", "pgm",
+                               "-f", "image2pipe", "-"], capture_output=True)
+        if proc.returncode != 0 or proc.stdout:
+            break
+    if proc.returncode != 0 or not proc.stdout:
+        log.error("ffmpeg не отдал кадр %.1f с для поиска полос:\n%s", t,
+                  proc.stderr.decode(errors="replace").strip()[-2000:])
+        return None
+    # PGM от ffmpeg: "P5\n<ширина> <высота>\n255\n" и байты яркости построчно.
+    _, dims, _, pixels = proc.stdout.split(b"\n", 3)
+    w, h = map(int, dims.split())
+    def black(y: int) -> bool:
+        return max(pixels[y * w:(y + 1) * w]) <= config.BARS_BLACK
+
+    top = next((y for y in range(h) if not black(y)), h)
+    bottom = next((h - 1 - y for y in range(h - 1, -1, -1) if not black(y)), h)
+    return w, h, top, bottom
 
 
 def detect_bars(video: Path, start: float, end: float) -> "str | None":
-    """Рамка без чёрных полос w:h:x:y по cropdetect в BARS_POINTS точках клипа или None."""
+    """Рамка без чёрных полос сверху и снизу w:h:0:y по BARS_POINTS кадрам клипа или None. Полосы
+    срезаются, только если почти во всех кадрах они одной высоты и сверху примерно как снизу:
+    тёмная картинка так стабильно себя не ведёт."""
     points = [start + (k + 0.5) * (end - start) / config.BARS_POINTS for k in range(config.BARS_POINTS)]
-    # Точки параллельно: почти всё время каждой уходит на перемотку от ключевого кадра.
+    # Кадры параллельно: почти всё время каждого уходит на перемотку от ключевого кадра.
     with ThreadPoolExecutor() as pool:
-        procs = list(pool.map(lambda t: cropdetect(video, t), points))
-    boxes = []
-    for proc in procs:
-        if proc.returncode != 0:
-            log.error("cropdetect завершился с кодом %d:\n%s", proc.returncode, proc.stderr.strip()[-2000:])
-            return None
-        # У совсем чёрного кадра ширина отрицательная, такая рамка под шаблон не попадает.
-        found = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", proc.stderr)
-        if found:
-            boxes.append([int(v) for v in found[-1]])
-    if not boxes:
+        frames = list(pool.map(lambda t: bar_rows(video, t), points))
+    if None in frames:
         return None
-    # Объединение рамок: в тёмной сцене cropdetect срезает и часть картинки.
-    x0, y0 = min(b[2] for b in boxes), min(b[3] for b in boxes)
-    x1, y1 = max(b[0] + b[2] for b in boxes), max(b[1] + b[3] for b in boxes)
-    return f"{x1 - x0}:{y1 - y0}:{x0}:{y0}"
+    w, h = frames[0][:2]
+    tol = config.BARS_TOL * h
+    pictures = [f for f in frames if f[2] + f[3] < h]  # совсем чёрный кадр ничего не говорит
+    if not pictures:
+        return None
+    top, bottom = median(f[2] for f in pictures), median(f[3] for f in pictures)
+    agree = [f for f in pictures if abs(f[2] - top) <= tol and abs(f[3] - bottom) <= tol]
+    if (len(agree) < config.BARS_AGREE * len(frames) or min(top, bottom) < config.BARS_MIN * h
+            or abs(top - bottom) > tol):
+        return None
+    # Срезаем по самой узкой полосе из согласных кадров, чтобы не задеть картинку.
+    y = (min(f[2] for f in agree) + 1) // 2 * 2
+    return f"{w}:{(h - y - min(f[3] for f in agree)) // 2 * 2}:0:{y}"
+
+
+def frame_size(bars: "str | None", size: list[float]) -> list[float]:
+    """Размер кадра после обрезки полос."""
+    return [int(v) for v in bars.split(":")[:2]] if bars else size
 
 
 def detect_faces(video: Path, spans: list[tuple[float, float]], step: float, **extra) -> "dict | None":
@@ -498,6 +512,28 @@ def detect_faces(video: Path, spans: list[tuple[float, float]], step: float, **e
         log.error("Детектор лиц завершился с кодом %d:\n%s", proc.returncode, proc.stderr.strip()[-2000:])
         return None
     return json.loads(proc.stdout)
+
+
+def track_faces(video: Path, spans: list[tuple[float, float]], bars: list, plans: list) -> list:
+    """Подставляет окно 9:16 по лицам в планы (раскладка, поля, причина) с раскладкой face (auto)
+    или crop. Замеры отдельные, 3 в секунду со склейками: замеры auto раз в секунду для выбора
+    раскладки остаются как были. Если детектор упал, face уходит в fit, crop режется по центру."""
+    ids = [i for i, (name, _, _) in enumerate(plans) if name in ("face", "crop")]
+    track = detect_faces(video, [spans[i] for i in ids], 1 / config.CROP_SAMPLE_FPS,
+                         crops=[bars[i] for i in ids], scene=config.CROP_SCENE)
+    plans = list(plans)
+    for k, i in enumerate(ids):
+        name, _, why = plans[i]
+        if track is None:
+            plans[i] = (("fit", {}, "слежение не сработало") if name == "face" else
+                        ("crop", {}, "детектор лиц не сработал, обрезка по центру"))
+            continue
+        start, end = spans[i]
+        cx, total, tracked = crop_track(track["clips"][k], track["cuts"][k],
+                                        frame_size(bars[i], track["size"]), end - start)
+        plans[i] = ("face", {"cx": cx}, ", ".join(
+            filter(None, [why, f"сцен {total}, со слежением {tracked}, по центру {total - tracked}"])))
+    return plans
 
 
 def render(video: Path, start: float, end: float, dst: Path, layout: str,
@@ -628,32 +664,26 @@ def make_clips(source: str, out_dir: Path, layout: str) -> "list[tuple[Path, str
         log.warning("Нет %s: клипы будут без субтитров и без подгонки к репликам", srt.name)
 
     spans = [snap(cues, float(s["start_time"]), float(s["end_time"])) for s in shorts]
-    bars, faces = [None] * len(spans), None
-    if layout in ("fit", "crop"):
+    started = clock.monotonic()
+    bars = [detect_bars(video, start, end) for start, end in spans]
+    timings["поиск полос"] = clock.monotonic() - started
+    plans = [(layout, {}, "")] * len(spans)
+    if layout == "auto":
         started = clock.monotonic()
-        bars = [detect_bars(video, start, end) for start, end in spans]
-        timings["поиск полос"] = clock.monotonic() - started
-    if layout in ("auto", "crop"):
-        started = clock.monotonic()
-        faces = (detect_faces(video, spans, config.AUTO_SAMPLE_SECONDS) if layout == "auto" else
-                 detect_faces(video, spans, 1 / config.CROP_SAMPLE_FPS, crops=bars, scene=config.CROP_SCENE))
+        faces = detect_faces(video, spans, config.AUTO_SAMPLE_SECONDS, crops=bars)
+        plans = ([pick_layout(samples, frame_size(bar, faces["size"])) for samples, bar in zip(faces["clips"], bars)]
+                 if faces else [("fit", {}, "детектор лиц не сработал")] * len(spans))
         timings["поиск лиц"] = clock.monotonic() - started
+    if any(name in ("face", "crop") for name, _, _ in plans):
+        started = clock.monotonic()
+        plans = track_faces(video, spans, bars, plans)
+        timings["слежение"] = clock.monotonic() - started
 
     clips = []
     started = clock.monotonic()
-    for i, (short, (start, end)) in enumerate(zip(shorts, spans), 1):
-        clip_layout, params = layout, {}
-        if layout == "auto":
-            clip_layout, params, why = (pick_layout(faces["clips"][i - 1], faces["size"]) if faces
-                                        else ("fit", {}, "детектор лиц не сработал"))
+    for i, (short, (start, end), (clip_layout, params, why)) in enumerate(zip(shorts, spans, plans), 1):
+        if why:
             log.info("Клип %d: раскладка %s, %s", i, clip_layout, why)
-        elif layout == "crop" and faces:
-            size = [int(v) for v in bars[i - 1].split(":")[:2]] if bars[i - 1] else faces["size"]
-            cx, total, tracked = crop_track(faces["clips"][i - 1], faces["cuts"][i - 1], size, end - start)
-            clip_layout, params = "face", {"cx": cx}
-            log.info("Клип %d: сцен %d, со слежением %d, по центру %d", i, total, tracked, total - tracked)
-        elif layout == "crop":
-            log.info("Клип %d: детектор лиц не сработал, обрезка по центру", i)
         pos = SUB_POS[clip_layout], TITLE_POS[clip_layout]
         if bars[i - 1]:
             log.info("Клип %d: кадр без чёрных полос %s", i, bars[i - 1])
