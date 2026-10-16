@@ -164,13 +164,16 @@ def write_ass(path: Path, cues: list[Cue], title: str, layout: str, duration: fl
     path.write_text(header + "\n".join(lines) + "\n", encoding="utf-8")
 
 
+def nearest(points: list[float], t: float) -> float:
+    """Ближайшая к t точка не дальше SNAP_MAX, иначе само t."""
+    near = [p for p in points if abs(p - t) <= config.SNAP_MAX]
+    return min(near, key=lambda p: abs(p - t)) if near else t
+
+
 def snap(cues: list[Cue], start: float, end: float) -> tuple[float, float]:
-    """Двигает границы клипа к началу и концу реплик, которые они разрезают, и добавляет запас."""
-    for a, b, _ in cues:
-        if a < start < b:
-            start = a
-        if a < end < b:
-            end = b
+    """Подтягивает начало к ближайшему началу реплики, конец к ближайшему концу, добавляет запас."""
+    start = nearest([a for a, _, _ in cues], start)
+    end = nearest([b for _, b, _ in cues], end)
     return max(0.0, start - config.SNAP_PAD), end + config.SNAP_PAD
 
 
