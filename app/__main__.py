@@ -107,7 +107,10 @@ TITLE_MARGIN = max(config.SAFE_LEFT, config.SAFE_RIGHT)
 TITLE_WIDTH = 1080 - 2 * TITLE_MARGIN
 TEXT_TOP = config.SAFE_TOP + 20             # верх заголовка
 TEXT_BOTTOM = 1920 - config.SAFE_BOTTOM - 20  # низ субтитров
-FIT_TOP = TEXT_TOP + 240                    # картинка fit ниже места под заголовок в две строки
+# fit: картинка 16:9 по центру по вертикали, заголовок прямо над ней. Две строки заголовка
+# над y=656 начинаются около y=420, то есть внутри безопасной зоны.
+FIT_TOP = (1920 - 1080 * 9 // 16) // 2      # 656
+FIT_BOTTOM = 1920 - FIT_TOP
 SPLIT_CAM_H = 768                          # в split вебка 1080x768 сверху, экран 1080x1152 снизу
 
 
@@ -207,7 +210,7 @@ def snap(cues: list[Cue], start: float, end: float) -> tuple[float, float]:
 LAYOUTS = {
     # Фон размываем на копии 270x480: boxblur на полном кадре в разы медленнее.
     "fit": "[0:v]split[a][b];[a]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,"
-           "boxblur=10:2,scale=1080:1920[bg];[b]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:" + str(FIT_TOP),
+           "boxblur=10:2,scale=1080:1920[bg];[b]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2",
     "split": "[0:v]split[a][b];[a]crop=iw*{w}:ih*{h}:iw*{x}:ih*{y},"
              f"scale=1080:{SPLIT_CAM_H}:force_original_aspect_ratio=increase,crop=1080:{SPLIT_CAM_H}[cam];"
              # Экран чуть приближен: при полной высоте в кадр попадал край вебки.
@@ -217,15 +220,15 @@ LAYOUTS = {
     # Окно 9:16 во всю высоту, центр по x следует за лицом: {cx} это выражение от t.
     "face": "[0:v]crop=w=ih*9/16:h=ih:x='clip(({cx})*iw-ow/2,0,iw-ow)':y=0,scale=1080:1920",
 }
-# Теги позиции. fit: заголовок над картинкой, субтитры под ней. split: заголовок под вебкой,
-# субтитры под заголовком, выше прицела (центр экрана, y=1344) и выше интерфейса TikTok внизу.
+# Теги позиции. fit: заголовок низом прямо над картинкой, субтитры под ней. split: заголовок под
+# вебкой, субтитры под заголовком, выше прицела (центр экрана, y=1344) и интерфейса TikTok внизу.
 # crop и face: заголовок сверху, субтитры снизу, оба внутри безопасной зоны.
 TOP_TITLE = rf"{{\an8\pos(540,{TEXT_TOP})}}"
 BOTTOM_SUB = rf"{{\an2\pos({SAFE_CX},{TEXT_BOTTOM})}}"
-SUB_POS = {"fit": rf"{{\an8\pos({SAFE_CX},{FIT_TOP + 640})}}",
+SUB_POS = {"fit": rf"{{\an8\pos({SAFE_CX},{FIT_BOTTOM + 20})}}",
            "split": rf"{{\an8\pos({SAFE_CX},{SPLIT_CAM_H + 250})}}",
            "crop": BOTTOM_SUB, "face": BOTTOM_SUB}
-TITLE_POS = {"fit": TOP_TITLE, "split": rf"{{\an8\pos(540,{SPLIT_CAM_H + 22})}}",
+TITLE_POS = {"fit": rf"{{\an2\pos(540,{FIT_TOP - 24})}}", "split": rf"{{\an8\pos(540,{SPLIT_CAM_H + 22})}}",
              "crop": TOP_TITLE, "face": TOP_TITLE}
 
 
