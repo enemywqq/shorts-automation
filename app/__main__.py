@@ -156,7 +156,7 @@ def reencode(src: Path, dst: Path, ass: "Path | None" = None) -> None:
     if ass:
         # Имя без пути и cwd в папке клипа: в фильтрах ffmpeg двоеточие из C:\ надо экранировать.
         cmd += ["-vf", f"ass={ass.name}"]
-    cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(dst)]
     subprocess.run(cmd, check=True, cwd=dst.parent)
 
