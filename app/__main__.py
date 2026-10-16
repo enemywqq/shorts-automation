@@ -193,8 +193,8 @@ def run_generator(cmd: list[str], env: dict) -> "dict[str, float] | None":
         if name == "выбор моментов" and clock.monotonic() - started > config.HIGHLIGHTS_TIMEOUT.total_seconds():
             proc.kill()
             proc.wait()
-            log.error("Выбор моментов идёт дольше %s, генератор остановлен. Скорее всего, завис "
-                      "запрос к Gemini: google-genai ждёт ответа без таймаута", config.HIGHLIGHTS_TIMEOUT)
+            log.error("Выбор моментов идёт дольше %s, генератор остановлен. Скорее всего, Gemini не "
+                      "отвечает или не применён патч генератора", config.HIGHLIGHTS_TIMEOUT)
             return None
         try:
             line = lines.get(timeout=HEARTBEAT_SECONDS)

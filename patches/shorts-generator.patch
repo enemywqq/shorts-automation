@@ -1,0 +1,87 @@
+diff --git a/shorts_generator/local/clipper.py b/shorts_generator/local/clipper.py
+index 931f99c..ae5f26a 100644
+--- a/shorts_generator/local/clipper.py
++++ b/shorts_generator/local/clipper.py
+@@ -12,6 +12,9 @@ from typing import Dict, List, Optional, Tuple
+ 
+ from ..config import LOCAL_OUTPUT_DIR
+ 
++DETECT_EVERY = 5
++DETECT_WIDTH = 320
++
+ 
+ def _ratio(aspect_ratio: str) -> float:
+     """Parse '9:16' → 9/16, '1:1' → 1.0."""
+@@ -26,9 +29,10 @@ def _cut_subclip(source_path: str, start: float, end: float, out_path: str) -> s
+     """ffmpeg -ss start -to end → re-encoded mp4 with audio."""
+     cmd = [
+         "ffmpeg", "-y", "-loglevel", "error",
+-        "-i", source_path,
++        # -ss до -i: ffmpeg прыгает к ключевому кадру, а не декодирует всё видео до start.
+         "-ss", f"{start:.3f}",
+         "-to", f"{end:.3f}",
++        "-i", source_path,
+         "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+         "-c:a", "aac", "-b:a", "128k",
+         out_path,
+@@ -67,6 +71,11 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
+     crop_h = max(2, crop_h - (crop_h % 2))
+ 
+     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
++    # Haar на каждом полном кадре съедал почти всё время кадрирования. Ищем лицо раз в
++    # DETECT_EVERY кадров на копии шириной DETECT_WIDTH, окно двигаем каждый кадр.
++    scale = min(1.0, DETECT_WIDTH / src_w)
++    min_face = max(20, int(40 * scale))
++    target: Optional[Tuple[int, int]] = None
+ 
+     silent_path = out_path + ".silent.mp4"
+     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+@@ -74,18 +83,23 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
+ 
+     last_center: Optional[Tuple[int, int]] = None
+     smoothing = 0.15  # how aggressively to chase a new face position
++    frame_no = 0
+     while True:
+         ret, frame = cap.read()
+         if not ret:
+             break
+ 
+-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+-        if len(faces) > 0:
+-            # Pick the largest face — usually the speaker.
+-            x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+-            cx = x + w // 2
+-            cy = y + h // 2
++        if frame_no % DETECT_EVERY == 0:
++            small = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
++            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
++            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(min_face, min_face))
++            if len(faces) > 0:
++                # Pick the largest face — usually the speaker.
++                x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
++                target = (int((x + w / 2) / scale), int((y + h / 2) / scale))
++        frame_no += 1
++        if target is not None:
++            cx, cy = target
+             if last_center is None:
+                 last_center = (cx, cy)
+             else:
+diff --git a/shorts_generator/local/llm.py b/shorts_generator/local/llm.py
+index 873c05d..09b54a7 100644
+--- a/shorts_generator/local/llm.py
++++ b/shorts_generator/local/llm.py
+@@ -37,7 +37,12 @@ def call_gemini_llm(prompt: str) -> str:
+             "    pip install -r requirements-local.txt"
+         ) from e
+ 
+-    client = genai.Client(api_key=require_gemini_key())
++    # Без http_options google-genai ждёт ответа вечно и не повторяет 503 "high demand".
++    # 5 попыток с паузами 1, 2, 4, 8 с, каждая не дольше 2 минут.
++    client = genai.Client(
++        api_key=require_gemini_key(),
++        http_options={"timeout": 120_000, "retry_options": {"attempts": 5}},
++    )
+     response = client.models.generate_content(
+         model=GEMINI_MODEL,
+         contents=prompt,

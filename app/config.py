@@ -14,8 +14,8 @@ GENERATOR_PYTHON = GENERATOR_DIR / _VENV_PYTHON
 NUM_CLIPS = 3
 CUT_NUM_CLIPS = 5  # для cut
 LANGUAGE = "ru"  # None = автоопределение Whisper
-# google-genai в генераторе ждёт ответа Gemini без таймаута и без повторов. Если этап
-# выбора моментов дольше этого, генератор убиваем.
+# Страховка от зависшего Gemini. С патчем генератора запрос живёт до ~10 минут (5 попыток
+# по 2 минуты), без патча ждёт вечно. Если этап выбора моментов дольше, генератор убиваем.
 HIGHLIGHTS_TIMEOUT = timedelta(minutes=10)
 
 UPLOADER_DIR = ROOT / "tools" / "tiktok-uploader"
