@@ -87,7 +87,7 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Sub,Arial,80,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,6,0,2,{ml},{mr},0,1
-Style: Title,{font},{size},{color},{color},&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,{outline},0,8,{ml},{mr},0,1
+Style: Title,{font},{size},{color},{color},&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,{outline},0,8,{tm},{tm},0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -101,6 +101,10 @@ TITLE_LINE_CHARS_AT_100 = 18
 # Геометрия кадра 1080x1920. Текст стоит внутри безопасной зоны TikTok и центрируется по ней.
 SAFE_WIDTH = 1080 - config.SAFE_LEFT - config.SAFE_RIGHT
 SAFE_CX = config.SAFE_LEFT + SAFE_WIDTH // 2
+# Заголовок по центру кадра: зона несимметрична (справа кнопки), поэтому оба поля берём
+# по большему боковому отступу, иначе текст съезжает влево.
+TITLE_MARGIN = max(config.SAFE_LEFT, config.SAFE_RIGHT)
+TITLE_WIDTH = 1080 - 2 * TITLE_MARGIN
 TEXT_TOP = config.SAFE_TOP + 20             # верх заголовка
 TEXT_BOTTOM = 1920 - config.SAFE_BOTTOM - 20  # низ субтитров
 FIT_TOP = TEXT_TOP + 240                    # картинка fit ниже места под заголовок в две строки
@@ -158,7 +162,7 @@ def ass_text(text: str) -> str:
 def title_layout(title: str) -> tuple[str, int]:
     """Текст заголовка для ASS и размер шрифта. Длинный заголовок режется на две строки по словам
     ближе к середине, шрифт уменьшается, пока длинная строка не влезет в безопасную зону."""
-    per_line = TITLE_LINE_CHARS_AT_100 * 100 / config.TITLE_SIZE * SAFE_WIDTH / 960
+    per_line = TITLE_LINE_CHARS_AT_100 * 100 / config.TITLE_SIZE * TITLE_WIDTH / 960
     words = title.split()
     if len(title) <= per_line or len(words) < 2:
         lines = [title]
@@ -180,7 +184,8 @@ def write_ass(path: Path, cues: list[Cue], title: str, layout: str, duration: fl
         lines.append(f"Dialogue: 1,{ass_time(0)},{ass_time(shown)},Title,,0,0,0,,"
                      f"{TITLE_POS[layout]}{{\\fs{size}}}{text}")
     header = ASS_HEADER.format(font=config.TITLE_FONT, size=config.TITLE_SIZE, color=config.TITLE_COLOR,
-                               outline=config.TITLE_OUTLINE, ml=config.SAFE_LEFT, mr=config.SAFE_RIGHT)
+                               outline=config.TITLE_OUTLINE, ml=config.SAFE_LEFT, mr=config.SAFE_RIGHT,
+                               tm=TITLE_MARGIN)
     path.write_text(header + "\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -215,12 +220,12 @@ LAYOUTS = {
 # Теги позиции. fit: заголовок над картинкой, субтитры под ней. split: заголовок под вебкой,
 # субтитры под заголовком, выше прицела (центр экрана, y=1344) и выше интерфейса TikTok внизу.
 # crop и face: заголовок сверху, субтитры снизу, оба внутри безопасной зоны.
-TOP_TITLE = rf"{{\an8\pos({SAFE_CX},{TEXT_TOP})}}"
+TOP_TITLE = rf"{{\an8\pos(540,{TEXT_TOP})}}"
 BOTTOM_SUB = rf"{{\an2\pos({SAFE_CX},{TEXT_BOTTOM})}}"
 SUB_POS = {"fit": rf"{{\an8\pos({SAFE_CX},{FIT_TOP + 640})}}",
            "split": rf"{{\an8\pos({SAFE_CX},{SPLIT_CAM_H + 250})}}",
            "crop": BOTTOM_SUB, "face": BOTTOM_SUB}
-TITLE_POS = {"fit": TOP_TITLE, "split": rf"{{\an8\pos({SAFE_CX},{SPLIT_CAM_H + 22})}}",
+TITLE_POS = {"fit": TOP_TITLE, "split": rf"{{\an8\pos(540,{SPLIT_CAM_H + 22})}}",
              "crop": TOP_TITLE, "face": TOP_TITLE}
 
 
