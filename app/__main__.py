@@ -13,6 +13,7 @@ import threading
 import time as clock
 from datetime import datetime, time, timedelta
 from pathlib import Path
+from statistics import median
 from urllib.parse import parse_qs, urlparse
 
 from . import config
@@ -85,17 +86,25 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Sub,Arial,80,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,6,0,2,80,80,400,1
-Style: Title,{font},{size},{color},{color},&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,{outline},0,8,60,60,220,1
+Style: Sub,Arial,80,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,6,0,2,{ml},{mr},0,1
+Style: Title,{font},{size},{color},{color},&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,{outline},0,8,{ml},{mr},0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
-# Около 21 символа на строку при шрифте 80 и ширине 1080: так кусок не вылезает за две строки.
+# Около 20 символов на строку при шрифте 80 в безопасной зоне: так кусок не вылезает за две строки.
 SUB_MAX_CHARS = 40
 # ponytail: ширина текста не измеряется, а оценивается по числу символов.
-# Подобрано на Russo One: при шрифте 100 в две строки влезает около 34 символов.
-TITLE_CHARS_AT_100 = 34
+# Подобрано на Russo One с обводкой: при шрифте 100 в строку шириной 960 влезает около 18 символов.
+TITLE_LINE_CHARS_AT_100 = 18
+
+# Геометрия кадра 1080x1920. Текст стоит внутри безопасной зоны TikTok и центрируется по ней.
+SAFE_WIDTH = 1080 - config.SAFE_LEFT - config.SAFE_RIGHT
+SAFE_CX = config.SAFE_LEFT + SAFE_WIDTH // 2
+TEXT_TOP = config.SAFE_TOP + 20             # верх заголовка
+TEXT_BOTTOM = 1920 - config.SAFE_BOTTOM - 20  # низ субтитров
+FIT_TOP = TEXT_TOP + 240                    # картинка fit ниже места под заголовок в две строки
+SPLIT_CAM_H = 768                           # в split вебка 1080x768 сверху, экран 1080x1152 снизу
 
 
 def read_srt(path: Path) -> list[Cue]:
@@ -146,10 +155,20 @@ def ass_text(text: str) -> str:
     return text.replace("\\", "/").replace("{", "(").replace("}", ")").replace("\n", " ")
 
 
-def title_size(title: str) -> int:
-    """Размер шрифта, при котором заголовок влезает в две строки."""
-    fits = TITLE_CHARS_AT_100 * 100 / config.TITLE_SIZE
-    return config.TITLE_SIZE if len(title) <= fits else int(config.TITLE_SIZE * fits / len(title))
+def title_layout(title: str) -> tuple[str, int]:
+    """Текст заголовка для ASS и размер шрифта. Длинный заголовок режется на две строки по словам
+    ближе к середине, шрифт уменьшается, пока длинная строка не влезет в безопасную зону."""
+    per_line = TITLE_LINE_CHARS_AT_100 * 100 / config.TITLE_SIZE * SAFE_WIDTH / 960
+    words = title.split()
+    if len(title) <= per_line or len(words) < 2:
+        lines = [title]
+    else:
+        cut = min(range(1, len(words)),
+                  key=lambda i: abs(len(" ".join(words[:i])) - len(" ".join(words[i:]))))
+        lines = [" ".join(words[:cut]), " ".join(words[cut:])]
+    longest = max(map(len, lines))
+    size = config.TITLE_SIZE if longest <= per_line else int(config.TITLE_SIZE * per_line / longest)
+    return r"\N".join(map(ass_text, lines)), size
 
 
 def write_ass(path: Path, cues: list[Cue], title: str, layout: str, duration: float) -> None:
@@ -157,10 +176,11 @@ def write_ass(path: Path, cues: list[Cue], title: str, layout: str, duration: fl
              for a, b, text in cues]
     if title:
         shown = config.TITLE_SECONDS or duration
+        text, size = title_layout(title)
         lines.append(f"Dialogue: 1,{ass_time(0)},{ass_time(shown)},Title,,0,0,0,,"
-                     f"{TITLE_POS[layout]}{{\\fs{title_size(title)}}}{ass_text(title)}")
-    header = ASS_HEADER.format(font=config.TITLE_FONT, size=config.TITLE_SIZE,
-                               color=config.TITLE_COLOR, outline=config.TITLE_OUTLINE)
+                     f"{TITLE_POS[layout]}{{\\fs{size}}}{text}")
+    header = ASS_HEADER.format(font=config.TITLE_FONT, size=config.TITLE_SIZE, color=config.TITLE_COLOR,
+                               outline=config.TITLE_OUTLINE, ml=config.SAFE_LEFT, mr=config.SAFE_RIGHT)
     path.write_text(header + "\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -177,27 +197,115 @@ def snap(cues: list[Cue], start: float, end: float) -> tuple[float, float]:
     return max(0.0, start - config.SNAP_PAD), end + config.SNAP_PAD
 
 
-# Видеофильтры макетов: вход [0:v], кадр 1080x1920. В split вебка 1080x768 сверху, экран 1080x1152 снизу.
+# Видеофильтры макетов: вход [0:v], кадр 1080x1920. Поля в {} подставляются в render.
 # ponytail: fit и позиция субтитров в нём рассчитаны на горизонтальный исходник 16:9.
 LAYOUTS = {
     # Фон размываем на копии 270x480: boxblur на полном кадре в разы медленнее.
     "fit": "[0:v]split[a][b];[a]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,"
-           "boxblur=10:2,scale=1080:1920[bg];[b]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2",
+           "boxblur=10:2,scale=1080:1920[bg];[b]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:" + str(FIT_TOP),
     "split": "[0:v]split[a][b];[a]crop=iw*{w}:ih*{h}:iw*{x}:ih*{y},"
-             "scale=1080:768:force_original_aspect_ratio=increase,crop=1080:768[cam];"
+             f"scale=1080:{SPLIT_CAM_H}:force_original_aspect_ratio=increase,crop=1080:{SPLIT_CAM_H}[cam];"
              # Экран чуть приближен: при полной высоте в кадр попадал край вебки.
-             "[b]crop=ih*0.9*1080/1152:ih*0.9,scale=1080:1152[scr];[cam][scr]vstack",
+             f"[b]crop=ih*0.9*1080/{1920 - SPLIT_CAM_H}:ih*0.9,scale=1080:{1920 - SPLIT_CAM_H}[scr];"
+             "[cam][scr]vstack",
     "crop": "[0:v]scale=-2:1920,crop=1080:1920",
+    # Окно 9:16 во всю высоту, центр по x следует за лицом: {cx} это выражение от t.
+    "face": "[0:v]crop=w=ih*9/16:h=ih:x='clip(({cx})*iw-ow/2,0,iw-ow)':y=0,scale=1080:1920",
 }
-# Теги позиции. В fit картинка 16:9 кончается на y=1264, ниже размытая полоса. В split заголовок
-# сразу под вебкой (она до y=768), субтитры у низа экрана: прицел в центре, y=1344, свободен.
-SUB_POS = {"fit": r"{\an8\pos(540,1300)}", "split": r"{\an2\pos(540,1840)}", "crop": ""}
-TITLE_POS = {"fit": "", "split": r"{\an8\pos(540,790)}", "crop": ""}
+# Теги позиции. fit: заголовок над картинкой, субтитры под ней. split: заголовок под вебкой,
+# субтитры под заголовком, выше прицела (центр экрана, y=1344) и выше интерфейса TikTok внизу.
+# crop и face: заголовок сверху, субтитры снизу, оба внутри безопасной зоны.
+TOP_TITLE = rf"{{\an8\pos({SAFE_CX},{TEXT_TOP})}}"
+BOTTOM_SUB = rf"{{\an2\pos({SAFE_CX},{TEXT_BOTTOM})}}"
+SUB_POS = {"fit": rf"{{\an8\pos({SAFE_CX},{FIT_TOP + 640})}}",
+           "split": rf"{{\an8\pos({SAFE_CX},{SPLIT_CAM_H + 250})}}",
+           "crop": BOTTOM_SUB, "face": BOTTOM_SUB}
+TITLE_POS = {"fit": TOP_TITLE, "split": rf"{{\an8\pos({SAFE_CX},{SPLIT_CAM_H + 22})}}",
+             "crop": TOP_TITLE, "face": TOP_TITLE}
+
+
+def cam_rect(face: list[float], size: list[float]) -> dict:
+    """Рамка вебки вокруг лица: высота AUTO_CAM_SCALE лиц, пропорции верхней панели split."""
+    h = min(1.0, face[3] * config.AUTO_CAM_SCALE)
+    w = min(1.0, h * size[1] / size[0] * 1080 / SPLIT_CAM_H)
+    x = min(max(face[0] - w / 2, 0.0), 1 - w)
+    y = min(max(face[1] - h * config.AUTO_CAM_FACE_Y, 0.0), 1 - h)
+    return {"x": round(x, 4), "y": round(y, 4), "w": round(w, 4), "h": round(h, 4)}
+
+
+def track_expr(samples: list) -> str:
+    """Выражение ffmpeg от t: сглаженный центр крупнейшего лица по x, линейно между замерами."""
+    xs, last = [], None
+    for _, boxes in samples:
+        if boxes:
+            last = max(boxes, key=lambda f: f[3])[0]
+        xs.append(last)
+    first = next(x for x in xs if x is not None)
+    xs = [first if x is None else x for x in xs]
+    k = config.AUTO_SMOOTH // 2
+    xs = [sum(xs[max(0, i - k):i + k + 1]) / len(xs[max(0, i - k):i + k + 1]) for i in range(len(xs))]
+    ts = [t for t, _ in samples]
+    expr = f"{xs[-1]:.4f}"
+    for i in range(len(xs) - 2, -1, -1):
+        expr = (f"if(lt(t,{ts[i + 1]}),{xs[i]:.4f}+({xs[i + 1] - xs[i]:.4f})*(t-{ts[i]})"
+                f"/{ts[i + 1] - ts[i]:.2f},{expr})")
+    return expr
+
+
+def pick_layout(samples: list, size: list[float]) -> tuple[str, dict, str]:
+    """(раскладка, поля фильтра, причина для лога) по замерам лиц одного клипа."""
+    faces = [(t, f) for t, boxes in samples for f in boxes]
+    if not faces:
+        return "fit", {}, "лиц нет"
+    n = len(samples)
+
+    def same_spot(a: list[float], b: list[float]) -> bool:
+        return abs(a[0] - b[0]) <= config.AUTO_STABLE and abs(a[1] - b[1]) <= config.AUTO_STABLE
+
+    def times(f: list[float]) -> set:
+        return {t for t, g in faces if same_spot(f, g)}
+
+    def motion(f: list[float]) -> float:
+        moves = [g[4] for _, g in faces if same_spot(f, g) and g[4] >= 0]
+        return median(moves) if moves else 0.0
+
+    # Вебка: из лиц, которые держатся на одном месте, самое живое. Аватар в оверлее тоже стоит
+    # на месте, но меняется реже лица в вебке, а совсем неподвижная картинка отсекается AUTO_STILL.
+    stable = [f for _, f in faces
+              if len(times(f)) / n >= config.AUTO_MIN_SHARE and motion(f) >= config.AUTO_STILL]
+    if stable:
+        anchor = max(stable, key=motion)
+        cam = [median(g[i] for _, g in faces if same_spot(anchor, g)) for i in range(4)]
+        share = len(times(anchor)) / n
+    if stable and cam[3] < config.AUTO_BIG_FACE and abs(cam[0] - 0.5) >= config.AUTO_EDGE:
+        rect = cam_rect(cam, size)
+        return "split", rect, (f"лицо высотой {cam[3]:.2f} стоит у края (x {cam[0]:.2f}, y {cam[1]:.2f}) "
+                               f"в {share:.0%} замеров, рамка вебки {rect}")
+
+    biggest = [max(boxes, key=lambda f: f[3]) for _, boxes in samples if boxes]
+    h, cx, share = median(f[3] for f in biggest), median(f[0] for f in biggest), len(biggest) / n
+    if share >= config.AUTO_MIN_SHARE and h >= config.AUTO_BIG_FACE and abs(cx - 0.5) <= config.AUTO_CENTER:
+        return "face", {"cx": track_expr(samples)}, (f"крупное лицо (высота {h:.2f}, x {cx:.2f}) "
+                                                     f"в {share:.0%} замеров")
+    return "fit", {}, (f"крупнейшее лицо в {share:.0%} замеров, высота {h:.2f}, x {cx:.2f}: "
+                       f"не крупное у центра и не вебка у края")
+
+
+def detect_faces(video: Path, spans: list[tuple[float, float]]) -> "dict | None":
+    """Замеры лиц по клипам из app/faces.py или None, если детектор упал."""
+    opts = {"spans": spans, "step": config.AUTO_SAMPLE_SECONDS, "score": config.AUTO_FACE_SCORE}
+    proc = subprocess.run([str(config.GENERATOR_PYTHON), str(Path(__file__).with_name("faces.py")),
+                           str(config.FACE_MODEL), str(video), json.dumps(opts)],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if proc.returncode != 0:
+        log.error("Детектор лиц завершился с кодом %d:\n%s", proc.returncode, proc.stderr.strip()[-2000:])
+        return None
+    return json.loads(proc.stdout)
 
 
 def render(video: Path, start: float, end: float, dst: Path, layout: str,
-           cam: "tuple | None", ass: "Path | None") -> None:
-    graph = LAYOUTS[layout].format(**dict(zip("xywh", cam or ()))) + ",setsar=1"
+           params: dict, ass: "Path | None") -> None:
+    graph = LAYOUTS[layout].format(**params) + ",setsar=1"
     if ass:
         # Имя без пути, cwd в папке клипа, fontsdir относительный: в фильтрах ffmpeg
         # двоеточие из C:\ надо экранировать.
@@ -295,19 +403,30 @@ def make_clips(source: str, out_dir: Path, num_clips: int, layout: str,
     if not cues:
         log.warning("Нет %s: клипы будут без субтитров и без подгонки к репликам", srt.name)
 
+    spans = [snap(cues, float(s["start_time"]), float(s["end_time"])) for s in shorts]
+    faces = None
+    if layout == "auto":
+        started = clock.monotonic()
+        faces = detect_faces(video, spans)
+        timings["поиск лиц"] = clock.monotonic() - started
+
     clips = []
     started = clock.monotonic()
-    for i, short in enumerate(shorts, 1):
-        start, end = snap(cues, float(short["start_time"]), float(short["end_time"]))
+    for i, (short, (start, end)) in enumerate(zip(shorts, spans), 1):
+        clip_layout, params = layout, dict(zip("xywh", cam or ()))
+        if layout == "auto":
+            clip_layout, params, why = (pick_layout(faces["clips"][i - 1], faces["size"]) if faces
+                                        else ("fit", {}, "детектор лиц не сработал"))
+            log.info("Клип %d: раскладка %s, %s", i, clip_layout, why)
         clip = out_dir / f"short_{i:02d}.mp4"
         ass = None
         if config.SUBTITLES or config.HOOK_TITLE:
             ass = clip.with_suffix(".ass")
             write_ass(ass, clip_cues(cues, start, end) if config.SUBTITLES else [],
-                      short["title"] if config.HOOK_TITLE else "", layout, end - start)
+                      short["title"] if config.HOOK_TITLE else "", clip_layout, end - start)
         log.info("Монтаж %d/%d: %s, с %.1f по %.1f с", i, len(shorts), clip.name, start, end)
         try:
-            render(video, start, end, clip, layout, cam, ass)
+            render(video, start, end, clip, clip_layout, params, ass)
         except subprocess.CalledProcessError as e:
             log.error("Пропуск, ffmpeg завершился с кодом %d: %s", e.returncode, clip.name)
             continue
@@ -346,9 +465,9 @@ def cmd_process(args: argparse.Namespace) -> int:
 
 def ask_layout() -> "tuple[str, str] | None":
     """Спрашивает макет и пресет вебки. Вопросы здесь, а не в cut.bat: cmd ломает UTF-8 bat с кириллицей."""
-    layout = {"2": "split", "3": "crop"}.get(input(
-        "Макет: 1 fit (весь кадр на размытом фоне), 2 split (вебка сверху, экран снизу), "
-        "3 crop (обрезка по центру)\nНомер [1]: ").strip(), "fit")
+    layout = {"2": "fit", "3": "split", "4": "crop"}.get(input(
+        "Макет: 1 auto (по лицам в кадре), 2 fit (весь кадр на размытом фоне), "
+        "3 split (вебка сверху, экран снизу), 4 crop (обрезка по центру)\nНомер [1]: ").strip(), "auto")
     if layout != "split":
         return layout, None
     presets = list(config.CAM_PRESETS)
@@ -497,15 +616,18 @@ def main() -> int:
     c.add_argument("--ask", action="store_true", help="спросить макет и пресет вебки (для cut.bat)")
     c.set_defaults(func=cmd_cut)
     for s in (p, c):
-        s.add_argument("--layout", choices=list(LAYOUTS), default=config.LAYOUT,
+        s.add_argument("--layout", choices=["auto", "fit", "split", "crop"], default=config.LAYOUT,
                        help=f"макет клипа (по умолчанию {config.LAYOUT})")
-        s.add_argument("--cam", choices=list(config.CAM_PRESETS), help="пресет вебки для split")
+        s.add_argument("--cam", choices=list(config.CAM_PRESETS),
+                       help="пресет вебки для split; при auto включает split с этим пресетом")
     sub.add_parser("upload", help="залить pending-клипы в свободные слоты").set_defaults(func=cmd_upload)
     sub.add_parser("status", help="показать очередь").set_defaults(func=cmd_status)
     r = sub.add_parser("retry", help="вернуть failed/unknown в pending")
     r.add_argument("ids", nargs="+", type=int)
     r.set_defaults(func=cmd_retry)
     args = parser.parse_args()
+    if getattr(args, "layout", None) == "auto" and args.cam:
+        args.layout = "split"
     if getattr(args, "layout", None) == "split" and not args.cam:
         parser.error(f"для --layout split нужен --cam, пресеты: {', '.join(config.CAM_PRESETS)}")
     logging.basicConfig(level=logging.INFO, format="%(message)s")
