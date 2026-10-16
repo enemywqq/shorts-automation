@@ -47,6 +47,8 @@ py -3.13 -m app cut                               # спросит ссылку 
 
 `process` и `cut` принимают и ссылку на YouTube, генератор скачает ролик через yt-dlp. Для ссылки имя папки берётся из id ролика.
 
+Пока генератор молчит, раз в минуту в консоль пишется текущий этап и сколько он уже идёт. В конце печатается время по этапам: транскрипция, выбор моментов, кадрирование, перекодирование. Если выбор моментов длится дольше `HIGHLIGHTS_TIMEOUT` (10 минут), генератор останавливается с ошибкой.
+
 **Субтитры и заголовок.** При перекодировании в клип вжигаются субтитры из транскрипта генератора (белый жирный шрифт с чёрной обводкой, нижняя треть кадра, не больше двух строк) и заголовок из `result.json` вверху кадра на первые 3 секунды. Выключаются флагами `SUBTITLES` и `HOOK_TITLE` в `app/config.py`. Размер шрифта и отступы лежат в `ASS_HEADER` в `app/__main__.py`.
 
 **Слоты.** `SLOTS` в [app/config.py](app/config.py) — время на каждый день по Владивостоку. Клипу достаётся ближайший слот, который не занят клипом в статусе `uploaded`/`unknown`, начинается не раньше чем через 20 минут (минимум TikTok — 15, плюс 5 минут на саму заливку) и не дальше 10 дней. Нет такого слота — клип ждёт следующего `upload`.
@@ -66,6 +68,31 @@ git clone --recurse-submodules https://github.com/enemywqq/shorts-automation.git
 # или, если уже склонировано без сабмодулей:
 git submodule update --init
 ```
+
+Затем накати патч генератора (следующий раздел).
+
+## Патч генератора
+
+В `patches/shorts-generator.patch` три правки генератора:
+- у запросов к Gemini таймаут 2 минуты и до 5 попыток с паузами 1, 2, 4, 8 с. Без этого google-genai ждёт ответа вечно, а один ответ 503 «high demand» роняет весь прогон;
+- кадрирование ищет лицо раз в 5 кадров на копии шириной 320 px. Раньше Haar гонялся по каждому полному кадру, на 1080p это было примерно в 7 раз медленнее;
+- при нарезке `-ss` стоит до `-i`, и ffmpeg больше не декодирует видео с начала до нужного момента.
+
+Патч накатывается после клонирования и после каждого обновления сабмодуля:
+
+```powershell
+git -C tools\shorts-generator checkout .                                  # снять старый патч
+git submodule update --init
+git -C tools\shorts-generator apply ..\..\patches\shorts-generator.patch
+```
+
+Если патч на месте, `git -C tools\shorts-generator apply --reverse --check ..\..\patches\shorts-generator.patch` ничего не выводит. Если после обновления `apply` падает, значит, генератор поменял эти файлы. Тогда правки переносятся вручную, а патч пересобирается:
+
+```powershell
+git -C tools\shorts-generator diff --output=..\..\patches\shorts-generator.patch
+```
+
+`--output` вместо `>`: Windows PowerShell 5.1 пишет перенаправление в UTF-16, и такой патч git не примет.
 
 Все команды ниже — PowerShell на Windows, из корня проекта. Python 3.11+ (3.13 подходит обоим).
 venv не активируем, а вызываем `.venv\Scripts\python` напрямую — так не мешает ExecutionPolicy.
@@ -95,6 +122,7 @@ copy .env.example .env
 ```ini
 LLM_PROVIDER=gemini                 # или openai
 GEMINI_API_KEY=...                  # или OPENAI_API_KEY=...
+GEMINI_MODEL=gemini-3.5-flash-lite  # полные flash-модели часто отвечают 503 high demand
 LOCAL_WHISPER_MODEL=small           # base по умолчанию; для русской речи small заметно лучше
 LOCAL_WHISPER_DEVICE=cpu
 LOCAL_OUTPUT_DIR=output
