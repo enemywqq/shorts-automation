@@ -86,14 +86,16 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Sub,Arial,80,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,6,0,2,80,80,400,1
-Style: Title,Arial,90,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,7,0,8,80,80,220,1
+Style: Title,{font},{size},{color},{color},&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,{outline},0,8,60,60,220,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 # Около 21 символа на строку при шрифте 80 и ширине 1080: так кусок не вылезает за две строки.
 SUB_MAX_CHARS = 40
-TITLE_SECONDS = 3.0
+# ponytail: ширина текста не измеряется, а оценивается по числу символов.
+# Подобрано на Russo One: при шрифте 100 в две строки влезает около 34 символов.
+TITLE_CHARS_AT_100 = 34
 
 
 def read_srt(path: Path) -> list[Cue]:
@@ -144,12 +146,22 @@ def ass_text(text: str) -> str:
     return text.replace("\\", "/").replace("{", "(").replace("}", ")").replace("\n", " ")
 
 
-def write_ass(path: Path, cues: list[Cue], title: str, sub_pos: str) -> None:
-    lines = [f"Dialogue: 0,{ass_time(a)},{ass_time(b)},Sub,,0,0,0,,{sub_pos}{ass_text(text)}"
+def title_size(title: str) -> int:
+    """Размер шрифта, при котором заголовок влезает в две строки."""
+    fits = TITLE_CHARS_AT_100 * 100 / config.TITLE_SIZE
+    return config.TITLE_SIZE if len(title) <= fits else int(config.TITLE_SIZE * fits / len(title))
+
+
+def write_ass(path: Path, cues: list[Cue], title: str, layout: str, duration: float) -> None:
+    lines = [f"Dialogue: 0,{ass_time(a)},{ass_time(b)},Sub,,0,0,0,,{SUB_POS[layout]}{ass_text(text)}"
              for a, b, text in cues]
     if title:
-        lines.append(f"Dialogue: 1,{ass_time(0)},{ass_time(TITLE_SECONDS)},Title,,0,0,0,,{ass_text(title)}")
-    path.write_text(ASS_HEADER + "\n".join(lines) + "\n", encoding="utf-8")
+        shown = config.TITLE_SECONDS or duration
+        lines.append(f"Dialogue: 1,{ass_time(0)},{ass_time(shown)},Title,,0,0,0,,"
+                     f"{TITLE_POS[layout]}{{\\fs{title_size(title)}}}{ass_text(title)}")
+    header = ASS_HEADER.format(font=config.TITLE_FONT, size=config.TITLE_SIZE,
+                               color=config.TITLE_COLOR, outline=config.TITLE_OUTLINE)
+    path.write_text(header + "\n".join(lines) + "\n", encoding="utf-8")
 
 
 def snap(cues: list[Cue], start: float, end: float) -> tuple[float, float]:
@@ -174,16 +186,20 @@ LAYOUTS = {
              "[b]crop=ih*0.9*1080/1152:ih*0.9,scale=1080:1152[scr];[cam][scr]vstack",
     "crop": "[0:v]scale=-2:1920,crop=1080:1920",
 }
-# Тег позиции субтитров. В fit картинка 16:9 кончается на y=1264, ниже размытая полоса.
-SUB_POS = {"fit": r"{\an8\pos(540,1300)}", "split": r"{\an5\pos(540,768)}", "crop": ""}
+# Теги позиции. В fit картинка 16:9 кончается на y=1264, ниже размытая полоса. В split заголовок
+# сразу под вебкой (она до y=768), субтитры у низа экрана: прицел в центре, y=1344, свободен.
+SUB_POS = {"fit": r"{\an8\pos(540,1300)}", "split": r"{\an2\pos(540,1840)}", "crop": ""}
+TITLE_POS = {"fit": "", "split": r"{\an8\pos(540,790)}", "crop": ""}
 
 
 def render(video: Path, start: float, end: float, dst: Path, layout: str,
            cam: "tuple | None", ass: "Path | None") -> None:
     graph = LAYOUTS[layout].format(**dict(zip("xywh", cam or ()))) + ",setsar=1"
     if ass:
-        # Имя без пути и cwd в папке клипа: в фильтрах ffmpeg двоеточие из C:\ надо экранировать.
-        graph += f",ass={ass.name}"
+        # Имя без пути, cwd в папке клипа, fontsdir относительный: в фильтрах ffmpeg
+        # двоеточие из C:\ надо экранировать.
+        fonts = Path(os.path.relpath(config.FONTS_DIR, dst.parent)).as_posix()
+        graph += f",ass={ass.name}:fontsdir={fonts}"
     cmd = [config.FFMPEG, "-y", "-loglevel", "error", "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
            "-i", str(video), "-filter_complex", graph + "[v]", "-map", "[v]", "-map", "0:a?",
            "-af", f"loudnorm=I={config.LOUDNESS}:TP=-1.5:LRA=11", "-ar", "48000",
@@ -285,7 +301,7 @@ def make_clips(source: str, out_dir: Path, num_clips: int, layout: str,
         if config.SUBTITLES or config.HOOK_TITLE:
             ass = clip.with_suffix(".ass")
             write_ass(ass, clip_cues(cues, start, end) if config.SUBTITLES else [],
-                      short["title"] if config.HOOK_TITLE else "", SUB_POS[layout])
+                      short["title"] if config.HOOK_TITLE else "", layout, end - start)
         log.info("Монтаж %d/%d: %s, с %.1f по %.1f с", i, len(shorts), clip.name, start, end)
         try:
             render(video, start, end, clip, layout, cam, ass)

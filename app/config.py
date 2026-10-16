@@ -24,9 +24,17 @@ TIKTOK_ACCOUNT = "main"  # имя из `cli.py login -n`
 
 FFMPEG = "ffmpeg"
 SUBTITLES = True   # вжигать субтитры из транскрипта генератора
-HOOK_TITLE = True  # заголовок клипа вверху кадра первые 3 секунды
+HOOK_TITLE = True  # вжигать заголовок клипа из result.json
 LOUDNESS = -14     # LUFS, громкость клипа после loudnorm
 SNAP_PAD = 0.3     # секунд запаса после подгонки границ клипа к репликам
+
+# Заголовок. Шрифт ищется в FONTS_DIR по имени семейства, цвет в формате ASS &H00BBGGRR.
+FONTS_DIR = ROOT / "fonts"
+TITLE_SECONDS = None        # None: весь клип, число: только первые N секунд
+TITLE_FONT = "Russo One"
+TITLE_SIZE = 96             # при длинном заголовке шрифт уменьшается, чтобы влезть в две строки
+TITLE_COLOR = "&H0000FFFF"  # ярко-жёлтый
+TITLE_OUTLINE = 10
 
 LAYOUT = "fit"  # макет по умолчанию: fit, split или crop
 # Вебка на исходнике для макета split: x, y, w, h в долях кадра, так что разрешение не важно.
