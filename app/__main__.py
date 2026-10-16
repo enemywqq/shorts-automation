@@ -108,7 +108,7 @@ TITLE_WIDTH = 1080 - 2 * TITLE_MARGIN
 TEXT_TOP = config.SAFE_TOP + 20             # верх заголовка
 TEXT_BOTTOM = 1920 - config.SAFE_BOTTOM - 20  # низ субтитров
 FIT_TOP = TEXT_TOP + 240                    # картинка fit ниже места под заголовок в две строки
-SPLIT_CAM_H = 768                           # в split вебка 1080x768 сверху, экран 1080x1152 снизу
+SPLIT_CAM_H = 768                          # в split вебка 1080x768 сверху, экран 1080x1152 снизу
 
 
 def read_srt(path: Path) -> list[Cue]:
@@ -397,8 +397,7 @@ def clip_count(seconds: float) -> int:
     return max(config.CLIPS_MIN, min(config.CLIPS_MAX, round(seconds / 60 / config.CLIP_EVERY_MINUTES)))
 
 
-def make_clips(source: str, out_dir: Path, layout: str,
-               cam: "tuple | None") -> "list[tuple[Path, str]] | None":
+def make_clips(source: str, out_dir: Path, layout: str) -> "list[tuple[Path, str]] | None":
     """Генератор выбирает моменты, ffmpeg монтирует клипы. Список (клип, заголовок) или None."""
     out_dir.mkdir(parents=True, exist_ok=True)
     # Генератору отдаём путь относительно его cwd: так он остаётся ASCII,
@@ -441,7 +440,7 @@ def make_clips(source: str, out_dir: Path, layout: str,
     clips = []
     started = clock.monotonic()
     for i, (short, (start, end)) in enumerate(zip(shorts, spans), 1):
-        clip_layout, params = layout, dict(zip("xywh", cam or ()))
+        clip_layout, params = layout, {}
         if layout == "auto":
             clip_layout, params, why = (pick_layout(faces["clips"][i - 1], faces["size"]) if faces
                                         else ("fit", {}, "детектор лиц не сработал"))
@@ -480,8 +479,7 @@ def cmd_process(args: argparse.Namespace) -> int:
         log.info("Уже обработан, клипы в очереди: %s", source)
         return 0
 
-    clips = make_clips(source, config.CLIPS_DIR / source_id(source, is_file),
-                       args.layout, config.CAM_PRESETS.get(args.cam))
+    clips = make_clips(source, config.CLIPS_DIR / source_id(source, is_file), args.layout)
     if clips is None:
         return 1
     db.executemany("INSERT INTO clips (path, caption, source) VALUES (?, ?, ?)",
@@ -491,19 +489,10 @@ def cmd_process(args: argparse.Namespace) -> int:
     return 0
 
 
-def ask_layout() -> "tuple[str, str] | None":
-    """Спрашивает макет и пресет вебки. Вопросы здесь, а не в cut.bat: cmd ломает UTF-8 bat с кириллицей."""
-    layout = {"2": "fit", "3": "split", "4": "crop"}.get(input(
-        "Макет: 1 auto (по лицам в кадре), 2 fit (весь кадр на размытом фоне), "
-        "3 split (вебка сверху, экран снизу), 4 crop (обрезка по центру)\nНомер [1]: ").strip(), "auto")
-    if layout != "split":
-        return layout, None
-    presets = list(config.CAM_PRESETS)
-    cam = input(f"Пресет вебки ({', '.join(presets)}) [{presets[0]}]: ").strip() or presets[0]
-    if cam not in config.CAM_PRESETS:
-        log.error("Нет пресета %s, есть: %s", cam, ", ".join(presets))
-        return None
-    return layout, cam
+def ask_layout() -> str:
+    """Спрашивает режим. Вопрос здесь, а не в cut.bat: cmd ломает UTF-8 bat с кириллицей."""
+    return {"2": "fit", "3": "crop"}.get(input(
+        "Режим: 1 Авто (стримы), 2 Фильм: весь кадр, 3 Фильм: обрезка\nНомер [1]: ").strip(), "auto")
 
 
 def cmd_cut(args: argparse.Namespace) -> int:
@@ -513,13 +502,10 @@ def cmd_cut(args: argparse.Namespace) -> int:
         return 1
     source, is_file = resolved
     if args.ask:
-        answer = ask_layout()
-        if answer is None:
-            return 1
-        args.layout, args.cam = answer
+        args.layout = ask_layout()
 
     out_dir = config.PREVIEW_DIR / source_id(source, is_file)
-    if make_clips(source, out_dir, args.layout, config.CAM_PRESETS.get(args.cam)) is None:
+    if make_clips(source, out_dir, args.layout) is None:
         return 1
     if os.name == "nt":
         os.startfile(out_dir)
@@ -641,23 +627,18 @@ def main() -> int:
     p.set_defaults(func=cmd_process)
     c = sub.add_parser("cut", help="только нарезать в data/preview, без очереди")
     c.add_argument("source", nargs="?", help="путь к видео или ссылка; без него спросит")
-    c.add_argument("--ask", action="store_true", help="спросить макет и пресет вебки (для cut.bat)")
+    c.add_argument("--ask", action="store_true", help="спросить режим (для cut.bat)")
     c.set_defaults(func=cmd_cut)
     for s in (p, c):
-        s.add_argument("--layout", choices=["auto", "fit", "split", "crop"], default=config.LAYOUT,
-                       help=f"макет клипа (по умолчанию {config.LAYOUT})")
-        s.add_argument("--cam", choices=list(config.CAM_PRESETS),
-                       help="пресет вебки для split; при auto включает split с этим пресетом")
+        s.add_argument("--layout", choices=["auto", "fit", "crop"], default=config.LAYOUT,
+                       help=f"auto: раскладка по лицам (стримы), fit: фильм, весь кадр, "
+                            f"crop: фильм, обрезка по центру (по умолчанию {config.LAYOUT})")
     sub.add_parser("upload", help="залить pending-клипы в свободные слоты").set_defaults(func=cmd_upload)
     sub.add_parser("status", help="показать очередь").set_defaults(func=cmd_status)
     r = sub.add_parser("retry", help="вернуть failed/unknown в pending")
     r.add_argument("ids", nargs="+", type=int)
     r.set_defaults(func=cmd_retry)
     args = parser.parse_args()
-    if getattr(args, "layout", None) == "auto" and args.cam:
-        args.layout = "split"
-    if getattr(args, "layout", None) == "split" and not args.cam:
-        parser.error(f"для --layout split нужен --cam, пресеты: {', '.join(config.CAM_PRESETS)}")
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     return args.func(args)
 
