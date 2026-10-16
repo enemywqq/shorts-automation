@@ -11,12 +11,18 @@ _VENV_PYTHON = Path(".venv", "Scripts", "python.exe") if os.name == "nt" else Pa
 
 GENERATOR_DIR = ROOT / "tools" / "shorts-generator"
 GENERATOR_PYTHON = GENERATOR_DIR / _VENV_PYTHON
-NUM_CLIPS = 3
-CUT_NUM_CLIPS = 5  # для cut
+# Клипов с исходника: один на CLIP_EVERY_MINUTES минут, не меньше CLIPS_MIN и не больше CLIPS_MAX.
+# Генератор даёт до 8 кандидатов на 20 минут, из них берём лучшие ~2. CLIPS_MAX = 2 слота в день
+# на 10 дней вперёд (MAX_LEAD): больше за один upload в расписание не встанет.
+CLIP_EVERY_MINUTES = 10
+CLIPS_MIN = 3
+CLIPS_MAX = 20
 LANGUAGE = "ru"  # None = автоопределение Whisper
-# Страховка от зависшего Gemini. С патчем генератора запрос живёт до ~10 минут (5 попыток
-# по 2 минуты), без патча ждёт вечно. Если этап выбора моментов дольше, генератор убиваем.
+# Страховка от зависшего Gemini: выбор моментов дольше HIGHLIGHTS_TIMEOUT плюс
+# HIGHLIGHTS_TIMEOUT_PER_HOUR на каждый час видео убивает генератор. С патчем один запрос живёт
+# до ~10 минут (5 попыток по 2 минуты), без патча ждёт вечно. Обычно 3 часа разбираются за ~2 минуты.
 HIGHLIGHTS_TIMEOUT = timedelta(minutes=10)
+HIGHLIGHTS_TIMEOUT_PER_HOUR = timedelta(minutes=5)
 
 UPLOADER_DIR = ROOT / "tools" / "tiktok-uploader"
 UPLOADER_PYTHON = UPLOADER_DIR / _VENV_PYTHON

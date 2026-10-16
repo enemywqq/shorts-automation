@@ -359,13 +359,14 @@ def run_generator(cmd: list[str], env: dict) -> "dict[str, float] | None":
     lines = queue.Queue()
     threading.Thread(target=pump, args=(proc.stdout, lines), daemon=True).start()
     timings, stage, started = {}, 0, clock.monotonic()
+    limit = config.HIGHLIGHTS_TIMEOUT.total_seconds()
     while True:
         name, end_marker = GENERATOR_STAGES[stage]
-        if name == "выбор моментов" and clock.monotonic() - started > config.HIGHLIGHTS_TIMEOUT.total_seconds():
+        if name == "выбор моментов" and clock.monotonic() - started > limit:
             proc.kill()
             proc.wait()
             log.error("Выбор моментов идёт дольше %s, генератор остановлен. Скорее всего, Gemini не "
-                      "отвечает или не применён патч генератора", config.HIGHLIGHTS_TIMEOUT)
+                      "отвечает или не применён патч генератора", duration(limit))
             return None
         try:
             line = lines.get(timeout=HEARTBEAT_SECONDS)
@@ -375,6 +376,10 @@ def run_generator(cmd: list[str], env: dict) -> "dict[str, float] | None":
         if line is None:
             break
         log.info("  %s", line)
+        # Длина видео приходит в строке конца транскрипции: длинному видео больше кусков для Gemini.
+        audio = re.search(r" segments, (\d+)s of audio", line)
+        if audio:
+            limit += int(audio[1]) / 3600 * config.HIGHLIGHTS_TIMEOUT_PER_HOUR.total_seconds()
         if end_marker and end_marker in line:
             timings[name] = clock.monotonic() - started
             log.info("Этап «%s»: %s", name, duration(timings[name]))
@@ -387,7 +392,12 @@ def run_generator(cmd: list[str], env: dict) -> "dict[str, float] | None":
     return timings
 
 
-def make_clips(source: str, out_dir: Path, num_clips: int, layout: str,
+def clip_count(seconds: float) -> int:
+    """Сколько клипов брать с исходника такой длины."""
+    return max(config.CLIPS_MIN, min(config.CLIPS_MAX, round(seconds / 60 / config.CLIP_EVERY_MINUTES)))
+
+
+def make_clips(source: str, out_dir: Path, layout: str,
                cam: "tuple | None") -> "list[tuple[Path, str]] | None":
     """Генератор выбирает моменты, ffmpeg монтирует клипы. Список (клип, заголовок) или None."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -397,7 +407,9 @@ def make_clips(source: str, out_dir: Path, num_clips: int, layout: str,
     result_json = os.path.join(out_rel, "result.json")
 
     cmd = [str(config.GENERATOR_PYTHON), "main.py", source, "--mode", "local",
-           "--num-clips", str(num_clips), "--output-json", result_json]
+           # Длина видео станет известна только после транскрипции, поэтому просим максимум
+           # и обрезаем по clip_count: shorts у генератора уже отсортированы по score.
+           "--num-clips", str(config.CLIPS_MAX), "--output-json", result_json]
     if config.LANGUAGE:
         cmd += ["--language", config.LANGUAGE]
     log.info("Генератор: %s", out_dir)
@@ -409,7 +421,9 @@ def make_clips(source: str, out_dir: Path, num_clips: int, layout: str,
         return None
 
     result = json.loads((config.GENERATOR_DIR / result_json).read_text(encoding="utf-8"))
-    shorts = result["shorts"]
+    seconds = float(result["transcript"]["duration"])
+    shorts = result["shorts"][:clip_count(seconds)]
+    log.info("Исходник %s: клипов %d из %d найденных", duration(seconds), len(shorts), len(result["shorts"]))
     video = (config.GENERATOR_DIR / result["source_video_url"]).resolve()
     # Генератор кэширует транскрипт исходника как <имя исходника>.srt в папке вывода.
     srt = out_dir / (video.stem + ".srt")
@@ -466,7 +480,7 @@ def cmd_process(args: argparse.Namespace) -> int:
         log.info("Уже обработан, клипы в очереди: %s", source)
         return 0
 
-    clips = make_clips(source, config.CLIPS_DIR / source_id(source, is_file), config.NUM_CLIPS,
+    clips = make_clips(source, config.CLIPS_DIR / source_id(source, is_file),
                        args.layout, config.CAM_PRESETS.get(args.cam))
     if clips is None:
         return 1
@@ -505,7 +519,7 @@ def cmd_cut(args: argparse.Namespace) -> int:
         args.layout, args.cam = answer
 
     out_dir = config.PREVIEW_DIR / source_id(source, is_file)
-    if make_clips(source, out_dir, config.CUT_NUM_CLIPS, args.layout, config.CAM_PRESETS.get(args.cam)) is None:
+    if make_clips(source, out_dir, args.layout, config.CAM_PRESETS.get(args.cam)) is None:
         return 1
     if os.name == "nt":
         os.startfile(out_dir)
