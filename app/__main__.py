@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time as clock
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from statistics import median
@@ -110,7 +112,6 @@ TEXT_BOTTOM = 1920 - config.SAFE_BOTTOM - 20  # низ субтитров
 # fit: картинка 16:9 по центру по вертикали, заголовок прямо над ней. Две строки заголовка
 # над y=656 начинаются около y=420, то есть внутри безопасной зоны.
 FIT_TOP = (1920 - 1080 * 9 // 16) // 2      # 656
-FIT_BOTTOM = 1920 - FIT_TOP
 SPLIT_CAM_H = 768                          # в split вебка 1080x768 сверху, экран 1080x1152 снизу
 
 
@@ -178,14 +179,15 @@ def title_layout(title: str) -> tuple[str, int]:
     return r"\N".join(map(ass_text, lines)), size
 
 
-def write_ass(path: Path, cues: list[Cue], title: str, layout: str, duration: float) -> None:
-    lines = [f"Dialogue: 0,{ass_time(a)},{ass_time(b)},Sub,,0,0,0,,{SUB_POS[layout]}{ass_text(text)}"
+def write_ass(path: Path, cues: list[Cue], title: str, pos: tuple[str, str], duration: float) -> None:
+    """pos: теги позиции субтитров и заголовка."""
+    lines = [f"Dialogue: 0,{ass_time(a)},{ass_time(b)},Sub,,0,0,0,,{pos[0]}{ass_text(text)}"
              for a, b, text in cues]
     if title:
         shown = config.TITLE_SECONDS or duration
         text, size = title_layout(title)
         lines.append(f"Dialogue: 1,{ass_time(0)},{ass_time(shown)},Title,,0,0,0,,"
-                     f"{TITLE_POS[layout]}{{\\fs{size}}}{text}")
+                     f"{pos[1]}{{\\fs{size}}}{text}")
     header = ASS_HEADER.format(font=config.TITLE_FONT, size=config.TITLE_SIZE, color=config.TITLE_COLOR,
                                outline=config.TITLE_OUTLINE, ml=config.SAFE_LEFT, mr=config.SAFE_RIGHT,
                                tm=TITLE_MARGIN)
@@ -216,19 +218,25 @@ LAYOUTS = {
              # Экран чуть приближен: при полной высоте в кадр попадал край вебки.
              f"[b]crop=ih*0.9*1080/{1920 - SPLIT_CAM_H}:ih*0.9,scale=1080:{1920 - SPLIT_CAM_H}[scr];"
              "[cam][scr]vstack",
+    # Обрезка по центру. В режиме crop остаётся на случай, если детектор лиц упал.
     "crop": "[0:v]scale=-2:1920,crop=1080:1920",
-    # Окно 9:16 во всю высоту, центр по x следует за лицом: {cx} это выражение от t.
+    # Окно 9:16 во всю высоту, центр по x следует за лицом: {cx} это выражение от t. Этим же
+    # фильтром монтируется режим crop.
     "face": "[0:v]crop=w=ih*9/16:h=ih:x='clip(({cx})*iw-ow/2,0,iw-ow)':y=0,scale=1080:1920",
 }
 # Теги позиции. fit: заголовок низом прямо над картинкой, субтитры под ней. split: заголовок под
 # вебкой, субтитры под заголовком, выше прицела (центр экрана, y=1344) и интерфейса TikTok внизу.
 # crop и face: заголовок сверху, субтитры снизу, оба внутри безопасной зоны.
+def fit_pos(top: int) -> tuple[str, str]:
+    """Позиции fit, когда верх картинки на top: субтитры под картинкой, заголовок низом над ней."""
+    return rf"{{\an8\pos({SAFE_CX},{1920 - top + 20})}}", rf"{{\an2\pos(540,{top - 24})}}"
+
+
 TOP_TITLE = rf"{{\an8\pos(540,{TEXT_TOP})}}"
 BOTTOM_SUB = rf"{{\an2\pos({SAFE_CX},{TEXT_BOTTOM})}}"
-SUB_POS = {"fit": rf"{{\an8\pos({SAFE_CX},{FIT_BOTTOM + 20})}}",
-           "split": rf"{{\an8\pos({SAFE_CX},{SPLIT_CAM_H + 250})}}",
+SUB_POS = {"fit": fit_pos(FIT_TOP)[0], "split": rf"{{\an8\pos({SAFE_CX},{SPLIT_CAM_H + 250})}}",
            "crop": BOTTOM_SUB, "face": BOTTOM_SUB}
-TITLE_POS = {"fit": rf"{{\an2\pos(540,{FIT_TOP - 24})}}", "split": rf"{{\an8\pos(540,{SPLIT_CAM_H + 22})}}",
+TITLE_POS = {"fit": fit_pos(FIT_TOP)[1], "split": rf"{{\an8\pos(540,{SPLIT_CAM_H + 22})}}",
              "crop": TOP_TITLE, "face": TOP_TITLE}
 
 
@@ -305,10 +313,184 @@ def pick_layout(samples: list, size: list[float]) -> tuple[str, dict, str]:
                        f"заметное и не у края только в {walking:.0%}: не вебка и не IRL")
 
 
-def detect_faces(video: Path, spans: list[tuple[float, float]]) -> "dict | None":
-    """Замеры лиц по клипам из app/faces.py или None, если детектор упал."""
-    opts = {"spans": spans, "step": config.AUTO_SAMPLE_SECONDS, "score": config.AUTO_FACE_SCORE,
-            "ffmpeg": config.FFMPEG}
+# Граница сцены чуть раньше склейки: время кадра в выражении и в выводе select может
+# разойтись в третьем знаке, а соседние кадры отстоят друг от друга хотя бы на 1/60 с.
+CUT_EPS = 0.005
+
+
+def scenes(cuts: list[float], length: float) -> list[tuple[float, float]]:
+    """Сцены клипа по склейкам. Сцена короче CROP_SCENE_MIN присоединяется к предыдущей,
+    а если она первая, к следующей."""
+    starts = [0.0]
+    for cut in cuts:
+        if cut - starts[-1] >= config.CROP_SCENE_MIN:
+            starts.append(cut - CUT_EPS)
+    if len(starts) > 1 and length - starts[-1] < config.CROP_SCENE_MIN:
+        starts.pop()
+    return list(zip(starts, starts[1:] + [length]))
+
+
+def same_face(boxes: list, face: list[float]) -> "list[float] | None":
+    """Лицо из boxes ближе всех к face, если оно сдвинулось не дальше своего размера."""
+    near = min(boxes, key=lambda f: abs(f[0] - face[0]) + abs(f[1] - face[1]))
+    return near if abs(near[0] - face[0]) <= face[2] and abs(near[1] - face[1]) <= face[3] else None
+
+
+def scene_targets(samples: list, window: float) -> "list[float | None]":
+    """Центр окна по x в каждом замере сцены: на главном лице или между ним и вторым, если оба
+    влезают в окно. None, если главного лица в замере нет."""
+    need = round(config.CROP_SWITCH_SECONDS * config.CROP_SAMPLE_FPS)
+    main, rivals, out = None, 0, []
+    for _, boxes in samples:
+        cur = same_face(boxes, main) if boxes and main else None
+        biggest = max(boxes, key=lambda f: f[3]) if boxes else None
+        # Гистерезис: другое лицо становится главным, только если оно заметно крупнее (или главного
+        # не видно) несколько замеров подряд. Иначе кадр мечется между собеседниками.
+        rivals = rivals + 1 if biggest and (cur is None or biggest[3] > cur[3] * config.CROP_SWITCH) else 0
+        if biggest and (main is None or rivals >= need):
+            cur, rivals = biggest, 0
+        if cur is None:
+            out.append(None)
+            continue
+        main = cur
+        left, right = cur[0] - cur[2] / 2, cur[0] + cur[2] / 2
+        pair = [f for f in boxes if f is not cur and f[3] >= cur[3] * config.CROP_PAIR]
+        if pair:
+            other = max(pair, key=lambda f: f[3])
+            both = min(left, other[0] - other[2] / 2), max(right, other[0] + other[2] / 2)
+            if both[1] - both[0] <= window:
+                left, right = both
+        out.append((left + right) / 2)
+    return out
+
+
+def fill_gaps(ts: list[float], xs: "list[float | None]") -> list[float]:
+    """Замеры без лица: до CROP_LOST_HOLD держим прошлое место (в начале сцены место, где лицо
+    скоро найдётся), дольше центр."""
+    first = next(((t, x) for t, x in zip(ts, xs) if x is not None), None)
+    out, last = [], None
+    for t, x in zip(ts, xs):
+        if x is not None:
+            last = (t, x)
+        elif last and t - last[0] <= config.CROP_LOST_HOLD:
+            x = last[1]
+        elif not last and first and first[0] - t <= config.CROP_LOST_HOLD:
+            x = first[1]
+        out.append(0.5 if x is None else x)
+    return out
+
+
+# Шаг расчёта движения окна, с. На шаге замеров (1/3 с) разгон выходил ступенькой: первый же
+# отрезок между точками уже шёл почти с полной скоростью.
+FOLLOW_STEP = 0.1
+
+
+def follow(ts: list[float], xs: list[float], end: float, window: float) -> list[tuple[float, float]]:
+    """Точки (t, x) пути окна от первого замера до end: окно стоит, пока цель в мёртвой зоне, иначе
+    едет к ней. Два сглаживания подряд дают плавный разгон и торможение без перелёта."""
+    goal = a = c = xs[0]
+    out = [(ts[0], c)]
+    for t, x, nxt in zip(ts, xs, ts[1:] + [end]):
+        if abs(x - goal) > config.CROP_DEADZONE * window:
+            goal = x
+        n = max(1, math.ceil((nxt - t) / FOLLOW_STEP - 1e-9))
+        k = 1 - math.exp(-(nxt - t) / n / config.CROP_SMOOTH)
+        for j in range(1, n + 1):
+            a += k * (goal - a)
+            c += k * (a - c)
+            out.append((t + (nxt - t) * j / n, c))
+    return out
+
+
+# Допуск упрощения пути окна в долях ширины кадра: около пикселя на 1920.
+KNOT_TOL = 0.0005
+
+
+def on_line(points: list[tuple[float, float]]) -> bool:
+    """Внутренние точки лежат на отрезке между крайними с допуском KNOT_TOL. Скачок не отрезок."""
+    (ta, xa), (tb, xb) = points[0], points[-1]
+    if tb - ta < 0.001:
+        return False
+    return all(abs(xa + (xb - xa) * (t - ta) / (tb - ta) - x) <= KNOT_TOL for t, x in points[1:-1])
+
+
+def knots_expr(knots: list[tuple[float, float]]) -> str:
+    """Кусочно-линейное выражение ffmpeg от t по точкам (t, x). Две точки в одно время дают скачок.
+    Сумма отрезков, потому что вложенные if eval в ffmpeg разбирает только до глубины около 90."""
+    # Точки, через которые ломаная и так проходит, выкидываем: ffmpeg считает всю сумму на каждом кадре.
+    keep, i = [knots[0]], 0
+    while i < len(knots) - 1:
+        j = i + 1
+        while j + 1 < len(knots) and on_line(knots[i:j + 2]):
+            j += 1
+        keep.append(knots[j])
+        i = j
+    keep = [(round(t, 3), round(x, 4)) for t, x in keep]
+    terms = []
+    for (t0, x0), (t1, x1) in zip(keep, keep[1:]):
+        if t1 - t0 >= 0.001:
+            seg = f"{x0}" if x0 == x1 else f"({x0}+{(x1 - x0) / (t1 - t0):.5f}*(t-{t0}))"
+            terms.append(f"gte(t,{t0})*lt(t,{t1})*{seg}")
+    return "+".join(terms + [f"gte(t,{keep[-1][0]})*{keep[-1][1]}"])
+
+
+def crop_track(samples: list, cuts: list[float], size: list[float], length: float) -> tuple[str, int, int]:
+    """Выражение ffmpeg от t для центра окна 9:16 по x в долях кадра, число сцен и сколько из них
+    со слежением. На склейке окно сразу встаёт на место, внутри сцены едет плавно."""
+    window = min(1.0, size[1] * 9 / 16 / size[0])
+    # Короткий кусок, присоединённый к сцене, это другой план: его лица окно не двигают.
+    bounds = [0.0, *(cut - CUT_EPS for cut in cuts), length]
+    short = [(a, b) for a, b in zip(bounds, bounds[1:]) if b - a < config.CROP_SCENE_MIN]
+    samples = [(t, [] if any(a <= t < b for a, b in short) else boxes) for t, boxes in samples]
+    knots, tracked = [], 0
+    parts = scenes(cuts, length)
+    for start, end in parts:
+        part = [(t, boxes) for t, boxes in samples if start <= t < end]
+        targets = scene_targets(part, window)
+        found = sum(x is not None for x in targets)
+        if not found or found < len(part) * config.CROP_FACE_SHARE:
+            knots += [(start, 0.5), (end, 0.5)]
+            continue
+        tracked += 1
+        ts = [t for t, _ in part]
+        xs = [min(max(x, window / 2), 1 - window / 2) for x in fill_gaps(ts, targets)]
+        path = follow(ts, xs, end, window)
+        knots += [(start, path[0][1]), *path]
+    return knots_expr(knots), len(parts), tracked
+
+
+def cropdetect(video: Path, t: float) -> subprocess.CompletedProcess:
+    return subprocess.run([config.FFMPEG, "-hide_banner", "-nostats", "-ss", f"{t:.3f}", "-i", str(video),
+                           "-vf", "cropdetect=round=2", "-frames:v", "5", "-f", "null", "-"],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+
+def detect_bars(video: Path, start: float, end: float) -> "str | None":
+    """Рамка без чёрных полос w:h:x:y по cropdetect в BARS_POINTS точках клипа или None."""
+    points = [start + (k + 0.5) * (end - start) / config.BARS_POINTS for k in range(config.BARS_POINTS)]
+    # Точки параллельно: почти всё время каждой уходит на перемотку от ключевого кадра.
+    with ThreadPoolExecutor() as pool:
+        procs = list(pool.map(lambda t: cropdetect(video, t), points))
+    boxes = []
+    for proc in procs:
+        if proc.returncode != 0:
+            log.error("cropdetect завершился с кодом %d:\n%s", proc.returncode, proc.stderr.strip()[-2000:])
+            return None
+        # У совсем чёрного кадра ширина отрицательная, такая рамка под шаблон не попадает.
+        found = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", proc.stderr)
+        if found:
+            boxes.append([int(v) for v in found[-1]])
+    if not boxes:
+        return None
+    # Объединение рамок: в тёмной сцене cropdetect срезает и часть картинки.
+    x0, y0 = min(b[2] for b in boxes), min(b[3] for b in boxes)
+    x1, y1 = max(b[0] + b[2] for b in boxes), max(b[1] + b[3] for b in boxes)
+    return f"{x1 - x0}:{y1 - y0}:{x0}:{y0}"
+
+
+def detect_faces(video: Path, spans: list[tuple[float, float]], step: float, **extra) -> "dict | None":
+    """Замеры лиц по клипам из app/faces.py или None, если детектор упал. extra уходит в его опции."""
+    opts = {"spans": spans, "step": step, "score": config.AUTO_FACE_SCORE, "ffmpeg": config.FFMPEG, **extra}
     proc = subprocess.run([str(config.GENERATOR_PYTHON), str(Path(__file__).with_name("faces.py")),
                            str(config.FACE_MODEL), str(video), json.dumps(opts)],
                           capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -319,21 +501,29 @@ def detect_faces(video: Path, spans: list[tuple[float, float]]) -> "dict | None"
 
 
 def render(video: Path, start: float, end: float, dst: Path, layout: str,
-           params: dict, ass: "Path | None") -> None:
+           params: dict, ass: "Path | None", bars: "str | None") -> None:
     # fps первым фильтром: дальше вся цепочка, включая ass, обрабатывает не больше OUTPUT_FPS кадров в секунду.
-    graph = LAYOUTS[layout].format(**params).replace(
-        "[0:v]", f"[0:v]fps='min(source_fps,{config.OUTPUT_FPS})',", 1) + ",setsar=1"
+    # Сразу за ним срезаются чёрные полосы, и макет получает чистую картинку.
+    pre = f"fps='min(source_fps,{config.OUTPUT_FPS})'," + (f"crop={bars}," if bars else "")
+    graph = LAYOUTS[layout].format(**params).replace("[0:v]", f"[0:v]{pre}", 1) + ",setsar=1"
     if ass:
         # Имя без пути, cwd в папке клипа, fontsdir относительный: в фильтрах ffmpeg
         # двоеточие из C:\ надо экранировать.
         fonts = Path(os.path.relpath(config.FONTS_DIR, dst.parent)).as_posix()
         graph += f",ass={ass.name}:fontsdir={fonts}"
+    # Граф файлом (-/ читает значение опции из файла): выражение слежения в crop бывает длиннее
+    # лимита командной строки Windows в 32767 символов.
+    script = dst.with_suffix(".filter")
+    script.write_text(graph + "[v]", encoding="utf-8")
     cmd = [config.FFMPEG, "-y", "-loglevel", "error", "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
-           "-i", str(video), "-filter_complex", graph + "[v]", "-map", "[v]", "-map", "0:a?",
+           "-i", str(video), "-/filter_complex", script.name, "-map", "[v]", "-map", "0:a?",
            "-af", f"loudnorm=I={config.LOUDNESS}:TP=-1.5:LRA=11", "-ar", "48000",
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(dst)]
-    subprocess.run(cmd, check=True, cwd=dst.parent)
+    try:
+        subprocess.run(cmd, check=True, cwd=dst.parent)
+    finally:
+        script.unlink(missing_ok=True)
 
 
 # Этап генератора и строка его вывода, на которой этап заканчивается. Последний длится до выхода.
@@ -438,10 +628,15 @@ def make_clips(source: str, out_dir: Path, layout: str) -> "list[tuple[Path, str
         log.warning("Нет %s: клипы будут без субтитров и без подгонки к репликам", srt.name)
 
     spans = [snap(cues, float(s["start_time"]), float(s["end_time"])) for s in shorts]
-    faces = None
-    if layout == "auto":
+    bars, faces = [None] * len(spans), None
+    if layout in ("fit", "crop"):
         started = clock.monotonic()
-        faces = detect_faces(video, spans)
+        bars = [detect_bars(video, start, end) for start, end in spans]
+        timings["поиск полос"] = clock.monotonic() - started
+    if layout in ("auto", "crop"):
+        started = clock.monotonic()
+        faces = (detect_faces(video, spans, config.AUTO_SAMPLE_SECONDS) if layout == "auto" else
+                 detect_faces(video, spans, 1 / config.CROP_SAMPLE_FPS, crops=bars, scene=config.CROP_SCENE))
         timings["поиск лиц"] = clock.monotonic() - started
 
     clips = []
@@ -452,15 +647,28 @@ def make_clips(source: str, out_dir: Path, layout: str) -> "list[tuple[Path, str
             clip_layout, params, why = (pick_layout(faces["clips"][i - 1], faces["size"]) if faces
                                         else ("fit", {}, "детектор лиц не сработал"))
             log.info("Клип %d: раскладка %s, %s", i, clip_layout, why)
+        elif layout == "crop" and faces:
+            size = [int(v) for v in bars[i - 1].split(":")[:2]] if bars[i - 1] else faces["size"]
+            cx, total, tracked = crop_track(faces["clips"][i - 1], faces["cuts"][i - 1], size, end - start)
+            clip_layout, params = "face", {"cx": cx}
+            log.info("Клип %d: сцен %d, со слежением %d, по центру %d", i, total, tracked, total - tracked)
+        elif layout == "crop":
+            log.info("Клип %d: детектор лиц не сработал, обрезка по центру", i)
+        pos = SUB_POS[clip_layout], TITLE_POS[clip_layout]
+        if bars[i - 1]:
+            log.info("Клип %d: кадр без чёрных полос %s", i, bars[i - 1])
+            if clip_layout == "fit":
+                w, h = (int(v) for v in bars[i - 1].split(":")[:2])
+                pos = fit_pos((1920 - round(540 * h / w) * 2) // 2)  # высота картинки как у scale=1080:-2
         clip = out_dir / f"short_{i:02d}.mp4"
         ass = None
         if config.SUBTITLES or config.HOOK_TITLE:
             ass = clip.with_suffix(".ass")
             write_ass(ass, clip_cues(cues, start, end) if config.SUBTITLES else [],
-                      short["title"] if config.HOOK_TITLE else "", clip_layout, end - start)
+                      short["title"] if config.HOOK_TITLE else "", pos, end - start)
         log.info("Монтаж %d/%d: %s, с %.1f по %.1f с", i, len(shorts), clip.name, start, end)
         try:
-            render(video, start, end, clip, clip_layout, params, ass)
+            render(video, start, end, clip, clip_layout, params, ass, bars[i - 1])
         except subprocess.CalledProcessError as e:
             log.error("Пропуск, ffmpeg завершился с кодом %d: %s", e.returncode, clip.name)
             continue
@@ -639,7 +847,7 @@ def main() -> int:
     for s in (p, c):
         s.add_argument("--layout", choices=["auto", "fit", "crop"], default=config.LAYOUT,
                        help=f"auto: раскладка по лицам (стримы), fit: фильм, весь кадр, "
-                            f"crop: фильм, обрезка по центру (по умолчанию {config.LAYOUT})")
+                            f"crop: фильм, обрезка 9:16 по лицам (по умолчанию {config.LAYOUT})")
     sub.add_parser("upload", help="залить pending-клипы в свободные слоты").set_defaults(func=cmd_upload)
     sub.add_parser("status", help="показать очередь").set_defaults(func=cmd_status)
     r = sub.add_parser("retry", help="вернуть failed/unknown в pending")
