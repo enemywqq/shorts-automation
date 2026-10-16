@@ -23,6 +23,7 @@ UPLOADER_PYTHON = UPLOADER_DIR / _VENV_PYTHON
 TIKTOK_ACCOUNT = "main"  # имя из `cli.py login -n`
 
 FFMPEG = "ffmpeg"
+OUTPUT_FPS = 30    # потолок частоты кадров клипа: на 60 fps исходника монтаж идёт примерно на треть дольше
 SUBTITLES = True   # вжигать субтитры из транскрипта генератора
 HOOK_TITLE = True  # вжигать заголовок клипа из result.json
 LOUDNESS = -14     # LUFS, громкость клипа после loudnorm

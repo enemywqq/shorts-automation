@@ -293,7 +293,8 @@ def pick_layout(samples: list, size: list[float]) -> tuple[str, dict, str]:
 
 def detect_faces(video: Path, spans: list[tuple[float, float]]) -> "dict | None":
     """Замеры лиц по клипам из app/faces.py или None, если детектор упал."""
-    opts = {"spans": spans, "step": config.AUTO_SAMPLE_SECONDS, "score": config.AUTO_FACE_SCORE}
+    opts = {"spans": spans, "step": config.AUTO_SAMPLE_SECONDS, "score": config.AUTO_FACE_SCORE,
+            "ffmpeg": config.FFMPEG}
     proc = subprocess.run([str(config.GENERATOR_PYTHON), str(Path(__file__).with_name("faces.py")),
                            str(config.FACE_MODEL), str(video), json.dumps(opts)],
                           capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -305,7 +306,9 @@ def detect_faces(video: Path, spans: list[tuple[float, float]]) -> "dict | None"
 
 def render(video: Path, start: float, end: float, dst: Path, layout: str,
            params: dict, ass: "Path | None") -> None:
-    graph = LAYOUTS[layout].format(**params) + ",setsar=1"
+    # fps первым фильтром: дальше вся цепочка, включая ass, обрабатывает не больше OUTPUT_FPS кадров в секунду.
+    graph = LAYOUTS[layout].format(**params).replace(
+        "[0:v]", f"[0:v]fps='min(source_fps,{config.OUTPUT_FPS})',", 1) + ",setsar=1"
     if ass:
         # Имя без пути, cwd в папке клипа, fontsdir относительный: в фильтрах ffmpeg
         # двоеточие из C:\ надо экранировать.
