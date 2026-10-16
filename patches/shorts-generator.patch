@@ -12,10 +12,34 @@ index 866b61f..dd5b122 100644
  
      if args.output_json:
 diff --git a/shorts_generator/highlights.py b/shorts_generator/highlights.py
-index 9b9a11f..c1c68f5 100644
+index 9b9a11f..a6dcab9 100644
 --- a/shorts_generator/highlights.py
 +++ b/shorts_generator/highlights.py
-@@ -56,6 +56,7 @@ Rules:
+@@ -11,7 +11,9 @@ drive either MuAPI (default, --mode api) or a direct local LLM client
+ (--mode local).
+ """
+ import json
++import os
+ import re
++from pathlib import Path
+ from typing import Callable, Dict, List, Optional
+ 
+ from . import muapi
+@@ -39,6 +41,13 @@ Virality signals to prioritize (ranked by impact):
+ """
+ 
+ 
++def virality_criteria() -> str:
++    # Критерии и правила заголовков лежат в репозитории оркестратора (prompts/highlights.txt),
++    # чтобы стиль правился без пересборки патча.
++    path = os.getenv("HIGHLIGHTS_PROMPT_FILE")
++    return Path(path).read_text(encoding="utf-8") if path else VIRALITY_CRITERIA
++
++
+ HIGHLIGHT_SYSTEM_PROMPT = """You are an elite short-form video editor who has studied thousands of viral clips on TikTok, Instagram Reels, and YouTube Shorts. You know exactly what makes viewers stop scrolling, watch to the end, and share.
+ 
+ {virality_criteria}
+@@ -56,6 +65,7 @@ Rules:
  - {num_clips_instruction}
  - For each highlight, identify the single best "hook_sentence" — the opening line that would make someone stop scrolling
  - Explain in one sentence why this clip is viral ("virality_reason")
@@ -23,7 +47,7 @@ index 9b9a11f..c1c68f5 100644
  
  Respond ONLY with valid JSON (no markdown, no explanation):
  {{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
-@@ -189,7 +190,9 @@ def chunk_transcript(transcript: Dict) -> List[Dict]:
+@@ -189,7 +199,9 @@ def chunk_transcript(transcript: Dict) -> List[Dict]:
          ]
          if chunk_segs:
              chunk = dict(transcript)
@@ -34,7 +58,16 @@ index 9b9a11f..c1c68f5 100644
              chunk["duration"] = end - start
              chunk["_offset"] = start
              chunks.append(chunk)
-@@ -292,7 +295,12 @@ def get_highlights(
+@@ -211,7 +223,7 @@ def call_highlight_api(
+     natural_max = max(2 if is_chunk else 3, int(duration / 90))
+     min_clips = min(target, natural_max, 8)
+     system = HIGHLIGHT_SYSTEM_PROMPT.format(
+-        virality_criteria=VIRALITY_CRITERIA,
++        virality_criteria=virality_criteria(),
+         content_type=content_info.get("content_type", "other"),
+         density=content_info.get("density", "medium"),
+         num_clips_instruction=f"Generate at least {min_clips} highlights",
+@@ -292,7 +304,12 @@ def get_highlights(
              offset = chunk.get("_offset", 0)
              text = build_transcript_text(chunk)
              print(f"[highlights] chunk {i + 1}/{len(chunks)} (offset {offset:.0f}s)", flush=True)
