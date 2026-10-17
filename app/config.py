@@ -21,6 +21,7 @@ CLIPS_MIN = [(30, 3), (60, 5), (120, 10), (float("inf"), 15)]
 FILM_MINUTES_PER_CLIP = 3.6
 FILM_CLIPS_MIN = 3
 CLIPS_MAX = {"stream": 40, "film": 60}
+CLIP_MIN_SECONDS = 10  # кандидаты короче не берутся, вместо них идут следующие по score
 LANGUAGE = "ru"  # None = автоопределение Whisper
 # Критерии выбора моментов: патч генератора подставляет этот файл в промпт.
 HIGHLIGHTS_PROMPT = ROOT / "prompts" / "highlights.txt"
