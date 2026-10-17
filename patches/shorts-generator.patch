@@ -12,7 +12,7 @@ index 866b61f..dd5b122 100644
  
      if args.output_json:
 diff --git a/shorts_generator/highlights.py b/shorts_generator/highlights.py
-index 9b9a11f..a6dcab9 100644
+index 9b9a11f..167389f 100644
 --- a/shorts_generator/highlights.py
 +++ b/shorts_generator/highlights.py
 @@ -11,7 +11,9 @@ drive either MuAPI (default, --mode api) or a direct local LLM client
@@ -30,8 +30,8 @@ index 9b9a11f..a6dcab9 100644
  
  
 +def virality_criteria() -> str:
-+    # Критерии и правила заголовков лежат в репозитории оркестратора (prompts/highlights.txt),
-+    # чтобы стиль правился без пересборки патча.
++    # Критерии лежат в репозитории оркестратора (prompts/highlights.txt), чтобы они правились
++    # без пересборки патча.
 +    path = os.getenv("HIGHLIGHTS_PROMPT_FILE")
 +    return Path(path).read_text(encoding="utf-8") if path else VIRALITY_CRITERIA
 +
@@ -39,7 +39,7 @@ index 9b9a11f..a6dcab9 100644
  HIGHLIGHT_SYSTEM_PROMPT = """You are an elite short-form video editor who has studied thousands of viral clips on TikTok, Instagram Reels, and YouTube Shorts. You know exactly what makes viewers stop scrolling, watch to the end, and share.
  
  {virality_criteria}
-@@ -56,6 +65,7 @@ Rules:
+@@ -56,12 +65,15 @@ Rules:
  - {num_clips_instruction}
  - For each highlight, identify the single best "hook_sentence" — the opening line that would make someone stop scrolling
  - Explain in one sentence why this clip is viral ("virality_reason")
@@ -47,7 +47,16 @@ index 9b9a11f..a6dcab9 100644
  
  Respond ONLY with valid JSON (no markdown, no explanation):
  {{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
-@@ -189,7 +199,9 @@ def chunk_transcript(transcript: Dict) -> List[Dict]:
+ 
+ 
+-CHUNK_SIZE_SECONDS = 1200       # 20-min chunks for long videos
++# Куски по 10 минут вместо 20: на один вызов модель отдаёт 5-10 кандидатов, сколько ни проси.
++# На 42 минутах стрима так вышло 30 кандидатов против 12, а оркестратору на полутора часах нужно больше 40.
++CHUNK_SIZE_SECONDS = 600
+ LONG_VIDEO_THRESHOLD = 1800     # chunk videos longer than 30 min
+ CHUNK_OVERLAP_SECONDS = 60
+ GPT_CALL_TIMEOUT_SECONDS = 300  # cap LLM polls at 5 min — a wedged call should fail fast
+@@ -189,7 +201,9 @@ def chunk_transcript(transcript: Dict) -> List[Dict]:
          ]
          if chunk_segs:
              chunk = dict(transcript)
@@ -58,16 +67,22 @@ index 9b9a11f..a6dcab9 100644
              chunk["duration"] = end - start
              chunk["_offset"] = start
              chunks.append(chunk)
-@@ -211,7 +223,7 @@ def call_highlight_api(
-     natural_max = max(2 if is_chunk else 3, int(duration / 90))
-     min_clips = min(target, natural_max, 8)
+@@ -208,10 +222,11 @@ def call_highlight_api(
+     # Ask for ~2× the user's target so dedupe has headroom, but cap so the model
+     # doesn't have to generate a huge JSON payload (which times out gpt-5-mini).
+     target = max(num_clips * 2, 5)
+-    natural_max = max(2 if is_chunk else 3, int(duration / 90))
+-    min_clips = min(target, natural_max, 8)
++    # Один кандидат на минуту, до 15 за вызов. Было на полторы минуты и не больше 8.
++    natural_max = max(2 if is_chunk else 3, int(duration / 60))
++    min_clips = min(target, natural_max, 15)
      system = HIGHLIGHT_SYSTEM_PROMPT.format(
 -        virality_criteria=VIRALITY_CRITERIA,
 +        virality_criteria=virality_criteria(),
          content_type=content_info.get("content_type", "other"),
          density=content_info.get("density", "medium"),
          num_clips_instruction=f"Generate at least {min_clips} highlights",
-@@ -292,7 +304,12 @@ def get_highlights(
+@@ -292,7 +307,12 @@ def get_highlights(
              offset = chunk.get("_offset", 0)
              text = build_transcript_text(chunk)
              print(f"[highlights] chunk {i + 1}/{len(chunks)} (offset {offset:.0f}s)", flush=True)
