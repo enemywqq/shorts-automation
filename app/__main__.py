@@ -721,6 +721,14 @@ def clip_name(rank: int, width: int, title: str) -> str:
     return f"{rank:0{width}d} {safe}.mp4"
 
 
+def capitalized(title: str, streamer: str, what: str) -> str:
+    """Заголовок с большой буквы: модель часто начинает ситуацию со строчной. Ник в начале не трогаем:
+    у мнения он стоит первым, даже если ник не задан и модель взяла его из названия."""
+    if what == "мнение" or (streamer and title.startswith(streamer)):
+        return title
+    return title[:1].upper() + title[1:]
+
+
 def make_clips(source: str, out_dir: Path, layout: str, kind: str,
                streamer: str) -> "list[tuple[Path, str]] | None":
     """Генератор выбирает моменты, ffmpeg монтирует клипы. Список (клип, заголовок) или None."""
@@ -774,6 +782,7 @@ def make_clips(source: str, out_dir: Path, layout: str, kind: str,
     kept = [i for i, t in enumerate(titles) if t]
     shorts, spans, titles = [shorts[i] for i in kept], [spans[i] for i in kept], [titles[i] for i in kept]
     for i, (short, (what, title)) in enumerate(zip(shorts, titles), 1):
+        title = capitalized(title, streamer, what)
         log.info("Клип %d, %s: %s (было: %s)", i, what or "без вида", title, short["title"])
         if len(title) > 50:
             log.warning("Клип %d: заголовок длиннее 50 символов", i)
