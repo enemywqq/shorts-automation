@@ -643,7 +643,8 @@ def pick_moments(highlights: list[dict], minutes: float, kind: str) -> list[dict
     минимума для длины исходника и не больше CLIPS_MAX."""
     long_enough = [h for h in highlights
                    if float(h["end_time"]) - float(h["start_time"]) >= config.CLIP_MIN_SECONDS]
-    ranked = sorted(long_enough, key=lambda h: int(h.get("score", 0)), reverse=True)
+    # При равном score раньше идёт момент, который раньше в исходнике: в этом порядке клипы нумеруются.
+    ranked = sorted(long_enough, key=lambda h: (-int(h.get("score", 0)), float(h["start_time"])))
     good = sum(int(h.get("score", 0)) >= config.CLIP_MIN_SCORE for h in ranked)
     return ranked[:min(config.CLIPS_MAX[kind], max(clips_min(minutes, kind), good))]
 
@@ -708,6 +709,16 @@ def rewrite_titles(texts: list[str], titles: list[str], kind: str, streamer: str
         log.error("Gemini не дал заголовки клипам %s:\n%s", missing, json.dumps(answer, ensure_ascii=False))
         return None
     return [got[i] for i in range(1, len(texts) + 1)]
+
+
+# Заголовок в имени файла клипа не длиннее этого: сами заголовки до 50 символов, это запас.
+CLIP_NAME_CHARS = 80
+
+
+def clip_name(rank: int, width: int, title: str) -> str:
+    """Имя файла клипа: ранг с ведущими нулями и заголовок без символов, запрещённых в Windows."""
+    safe = " ".join(re.sub(r'[\\/:*?"<>|\x00-\x1f]', " ", title).split())[:CLIP_NAME_CHARS].rstrip(" .")
+    return f"{rank:0{width}d} {safe}.mp4"
 
 
 def make_clips(source: str, out_dir: Path, layout: str, kind: str,
@@ -783,6 +794,11 @@ def make_clips(source: str, out_dir: Path, layout: str, kind: str,
         plans = track_faces(video, spans, bars, plans)
         timings["слежение"] = clock.monotonic() - started
 
+    # Клипы прошлого прогона с другими заголовками не перезапишутся и перепутают порядок.
+    for old in out_dir.glob("*.mp4"):
+        if re.match(r"\d+ |short_\d+\.mp4$", old.name):
+            old.unlink()
+    width = max(2, len(str(len(shorts))))
     clips = []
     started = clock.monotonic()
     for i, (short, (start, end), (clip_layout, params, why)) in enumerate(zip(shorts, spans, plans), 1):
@@ -794,10 +810,11 @@ def make_clips(source: str, out_dir: Path, layout: str, kind: str,
             if clip_layout == "fit":
                 w, h = (int(v) for v in bars[i - 1].split(":")[:2])
                 pos = fit_pos((1920 - round(540 * h / w) * 2) // 2)  # высота картинки как у scale=1080:-2
-        clip = out_dir / f"short_{i:02d}.mp4"
+        clip = out_dir / clip_name(i, width, short["title"])
         ass = None
         if config.SUBTITLES or config.HOOK_TITLE:
-            ass = clip.with_suffix(".ass")
+            # Имя без заголовка: оно уходит в фильтр ass, и кавычка или запятая сломали бы синтаксис.
+            ass = out_dir / f"{i:0{width}d}.ass"
             write_ass(ass, clip_cues(cues, start, end) if config.SUBTITLES else [],
                       short["title"] if config.HOOK_TITLE else "", pos, end - start)
         log.info("Монтаж %d/%d: %s, с %.1f по %.1f с", i, len(shorts), clip.name, start, end)
