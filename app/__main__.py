@@ -621,6 +621,17 @@ def run_generator(cmd: list[str], env: dict) -> "dict[str, float] | None":
     return timings
 
 
+def media_minutes(video: Path) -> "float | None":
+    """Длина файла в минутах по ffprobe или None."""
+    proc = subprocess.run([config.FFPROBE, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+                           str(video)], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    try:
+        return float(proc.stdout) / 60
+    except ValueError:
+        log.error("ffprobe не отдал длину %s (код %d):\n%s", video.name, proc.returncode, proc.stderr.strip()[-2000:])
+        return None
+
+
 def clips_min(minutes: float, kind: str) -> int:
     if kind == "film":
         return max(config.FILM_CLIPS_MIN, round(minutes / config.FILM_MINUTES_PER_CLIP))
@@ -722,13 +733,18 @@ def make_clips(source: str, out_dir: Path, layout: str, kind: str,
         return None
 
     result = json.loads((config.GENERATOR_DIR / result_json).read_text(encoding="utf-8"))
-    minutes = float(result["transcript"]["duration"]) / 60
+    video = (config.GENERATOR_DIR / result["source_video_url"]).resolve()
+    # Длина по файлу, а не по транскрипту: из кэша транскрипт длится до последней реплики, и у фильма
+    # с музыкой и тишиной выходило 7 минут из 12.
+    minutes = media_minutes(video)
+    if minutes is None:
+        minutes = float(result["transcript"]["duration"]) / 60
+        log.warning("Длина взята по транскрипту: %.0f мин", minutes)
     shorts = pick_moments(result["highlights"], minutes, kind)
     log.info("Кандидатов %d, score: %s. Клипов %d (порог %d, от %d до %d при длине %.0f мин)",
              len(result["highlights"]),
              " ".join(str(h.get("score")) for h in sorted(result["highlights"], key=lambda h: -int(h.get("score", 0)))),
              len(shorts), config.CLIP_MIN_SCORE, clips_min(minutes, kind), config.CLIPS_MAX[kind], minutes)
-    video = (config.GENERATOR_DIR / result["source_video_url"]).resolve()
     # Генератор кэширует транскрипт исходника как <имя исходника>.srt в папке вывода.
     srt = out_dir / (video.stem + ".srt")
     cues = read_srt(srt) if srt.is_file() else []
