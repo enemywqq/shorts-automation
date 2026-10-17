@@ -639,12 +639,18 @@ def clips_min(minutes: float, kind: str) -> int:
 
 
 def pick_moments(highlights: list[dict], minutes: float, kind: str) -> list[dict]:
-    """Моменты не короче CLIP_MIN_SECONDS со score от CLIP_MIN_SCORE по убыванию score, не меньше
-    минимума для длины исходника и не больше CLIPS_MAX."""
+    """Моменты не короче CLIP_MIN_SECONDS и без перекрытия больше CLIP_MAX_OVERLAP с моментами выше
+    по score, со score от CLIP_MIN_SCORE по убыванию score, не меньше минимума для длины исходника
+    и не больше CLIPS_MAX."""
     long_enough = [h for h in highlights
                    if float(h["end_time"]) - float(h["start_time"]) >= config.CLIP_MIN_SECONDS]
     # При равном score раньше идёт момент, который раньше в исходнике: в этом порядке клипы нумеруются.
-    ranked = sorted(long_enough, key=lambda h: (-int(h.get("score", 0)), float(h["start_time"])))
+    ranked = []
+    for h in sorted(long_enough, key=lambda h: (-int(h.get("score", 0)), float(h["start_time"]))):
+        start, end = float(h["start_time"]), float(h["end_time"])
+        if all(min(end, float(k["end_time"])) - max(start, float(k["start_time"]))
+               <= config.CLIP_MAX_OVERLAP * (end - start) for k in ranked):
+            ranked.append(h)
     good = sum(int(h.get("score", 0)) >= config.CLIP_MIN_SCORE for h in ranked)
     return ranked[:min(config.CLIPS_MAX[kind], max(clips_min(minutes, kind), good))]
 
