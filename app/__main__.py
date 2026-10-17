@@ -621,14 +621,82 @@ def run_generator(cmd: list[str], env: dict) -> "dict[str, float] | None":
     return timings
 
 
-def pick_moments(highlights: list[dict]) -> list[dict]:
-    """Моменты со score от CLIP_MIN_SCORE, по убыванию score, не меньше CLIPS_MIN и не больше CLIPS_MAX."""
+def clips_min(minutes: float) -> int:
+    return next(n for limit, n in config.CLIPS_MIN if minutes < limit)
+
+
+def pick_moments(highlights: list[dict], minutes: float) -> list[dict]:
+    """Моменты со score от CLIP_MIN_SCORE по убыванию score, не меньше минимума для длины исходника
+    и не больше CLIPS_MAX."""
     ranked = sorted(highlights, key=lambda h: int(h.get("score", 0)), reverse=True)
     good = sum(int(h.get("score", 0)) >= config.CLIP_MIN_SCORE for h in ranked)
-    return ranked[:max(config.CLIPS_MIN, min(config.CLIPS_MAX, good))]
+    return ranked[:max(clips_min(minutes), min(config.CLIPS_MAX, good))]
 
 
-def make_clips(source: str, out_dir: Path, layout: str) -> "list[tuple[Path, str]] | None":
+GEMINI_BLOCKED = 3  # код выхода app/gemini.py: промпт заблокирован фильтром
+
+
+def ask_gemini(prompt: str) -> "tuple[bool, dict | list | None]":
+    """(промпт заблокирован фильтром, JSON-ответ Gemini через app/gemini.py или None при ошибке)."""
+    proc = subprocess.run([str(config.GENERATOR_PYTHON), str(Path(__file__).with_name("gemini.py"))],
+                          input=prompt, cwd=config.GENERATOR_DIR, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+    if proc.returncode == GEMINI_BLOCKED:
+        return True, None
+    if proc.returncode != 0:
+        log.error("Запрос к Gemini завершился с кодом %d:\n%s", proc.returncode, proc.stderr.strip()[-2000:])
+        return False, None
+    try:
+        return False, json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        log.error("Gemini вернул не JSON (%s):\n%s", e, proc.stdout[-2000:])
+        return False, None
+
+
+TITLES_FORMAT = """
+Ответь только JSON без пояснений:
+{"titles":[{"clip":1,"kind":"string","title":"string"}]}
+Заголовок нужен для каждого клипа, clip это его номер."""
+
+
+def rewrite_titles(texts: list[str], titles: list[str], kind: str, streamer: str,
+                   name: str) -> "list[tuple[str, str] | None] | None":
+    """Один запрос к Gemini на все клипы: (вид момента, новый заголовок) по транскрипту клипа, None на
+    месте клипа, который фильтр Gemini не пропускает, или None целиком при ошибке."""
+    who = ""
+    if kind == "stream":
+        who = (f"Ник стримера: {streamer}. Пиши его ровно так, буква в букву.\n" if streamer else
+               f"Ник стримера не задан. Возьми его из названия видео или ссылки: {name}\n")
+    clips = "\n\n".join(f"Клип {i}. Черновой заголовок: {title}\nТранскрипт: {text}"
+                        for i, (text, title) in enumerate(zip(texts, titles), 1))
+    prompt = f"{config.TITLES_PROMPT[kind].read_text(encoding='utf-8')}\n{who}{TITLES_FORMAT}\n\n{clips}"
+    blocked, answer = ask_gemini(prompt)
+    if blocked and len(texts) == 1:
+        log.warning("Фильтр Gemini не пропускает клип, он пропущен: %s", titles[0])
+        return [None]
+    if blocked:
+        # Фильтр блокирует и сочетание клипов, каждый из которых по отдельности проходит:
+        # на IRL ЭВЕЛОНА так было с 10 клипами.
+        log.warning("Фильтр Gemini заблокировал запрос на %d клипов, делю пополам", len(texts))
+        mid = len(texts) // 2
+        head = rewrite_titles(texts[:mid], titles[:mid], kind, streamer, name)
+        tail = head and rewrite_titles(texts[mid:], titles[mid:], kind, streamer, name)
+        return head + tail if tail else None
+    if answer is None:
+        return None
+    # Модель иногда отдаёт голый список вместо {"titles": [...]}.
+    items = answer if isinstance(answer, list) else answer.get("titles", [])
+    got = {int(t["clip"]): (str(t.get("kind", "")), str(t["title"]).strip())
+           for t in items if t.get("clip") and t.get("title")}
+    missing = [i for i in range(1, len(texts) + 1) if not got.get(i, ("", ""))[1]]
+    if missing:
+        log.error("Gemini не дал заголовки клипам %s:\n%s", missing, json.dumps(answer, ensure_ascii=False))
+        return None
+    return [got[i] for i in range(1, len(texts) + 1)]
+
+
+def make_clips(source: str, out_dir: Path, layout: str, kind: str,
+               streamer: str) -> "list[tuple[Path, str]] | None":
     """Генератор выбирает моменты, ffmpeg монтирует клипы. Список (клип, заголовок) или None."""
     out_dir.mkdir(parents=True, exist_ok=True)
     # Генератору отдаём путь относительно его cwd: так он остаётся ASCII,
@@ -652,10 +720,12 @@ def make_clips(source: str, out_dir: Path, layout: str) -> "list[tuple[Path, str
         return None
 
     result = json.loads((config.GENERATOR_DIR / result_json).read_text(encoding="utf-8"))
-    shorts = pick_moments(result["highlights"])
-    log.info("Кандидатов %d, score: %s. Клипов %d (порог %d, от %d до %d)", len(result["highlights"]),
+    minutes = float(result["transcript"]["duration"]) / 60
+    shorts = pick_moments(result["highlights"], minutes)
+    log.info("Кандидатов %d, score: %s. Клипов %d (порог %d, от %d до %d при длине %.0f мин)",
+             len(result["highlights"]),
              " ".join(str(h.get("score")) for h in sorted(result["highlights"], key=lambda h: -int(h.get("score", 0)))),
-             len(shorts), config.CLIP_MIN_SCORE, config.CLIPS_MIN, config.CLIPS_MAX)
+             len(shorts), config.CLIP_MIN_SCORE, clips_min(minutes), config.CLIPS_MAX, minutes)
     video = (config.GENERATOR_DIR / result["source_video_url"]).resolve()
     # Генератор кэширует транскрипт исходника как <имя исходника>.srt в папке вывода.
     srt = out_dir / (video.stem + ".srt")
@@ -664,6 +734,20 @@ def make_clips(source: str, out_dir: Path, layout: str) -> "list[tuple[Path, str
         log.warning("Нет %s: клипы будут без субтитров и без подгонки к репликам", srt.name)
 
     spans = [snap(cues, float(s["start_time"]), float(s["end_time"])) for s in shorts]
+    started = clock.monotonic()
+    texts = [" ".join(text for a, b, text in cues if b > start and a < end) for start, end in spans]
+    titles = rewrite_titles(texts, [s["title"] for s in shorts], kind, streamer,
+                            Path(source).name if Path(source).is_file() else source)
+    if titles is None:
+        return None
+    kept = [i for i, t in enumerate(titles) if t]
+    shorts, spans, titles = [shorts[i] for i in kept], [spans[i] for i in kept], [titles[i] for i in kept]
+    for i, (short, (what, title)) in enumerate(zip(shorts, titles), 1):
+        log.info("Клип %d, %s: %s (было: %s)", i, what or "без вида", title, short["title"])
+        if len(title) > 50:
+            log.warning("Клип %d: заголовок длиннее 50 символов", i)
+        short["title"] = title
+    timings["заголовки"] = clock.monotonic() - started
     started = clock.monotonic()
     bars = [detect_bars(video, start, end) for start, end in spans]
     timings["поиск полос"] = clock.monotonic() - started
@@ -724,7 +808,8 @@ def cmd_process(args: argparse.Namespace) -> int:
         log.info("Уже обработан, клипы в очереди: %s", source)
         return 0
 
-    clips = make_clips(source, config.CLIPS_DIR / source_id(source, is_file), args.layout)
+    clips = make_clips(source, config.CLIPS_DIR / source_id(source, is_file), args.layout, args.type,
+                       args.streamer)
     if clips is None:
         return 1
     db.executemany("INSERT INTO clips (path, caption, source) VALUES (?, ?, ?)",
@@ -734,10 +819,15 @@ def cmd_process(args: argparse.Namespace) -> int:
     return 0
 
 
-def ask_layout() -> str:
-    """Спрашивает режим. Вопрос здесь, а не в cut.bat: cmd ломает UTF-8 bat с кириллицей."""
-    return {"2": "fit", "3": "crop"}.get(input(
-        "Режим: 1 Авто (стримы), 2 Фильм: весь кадр, 3 Фильм: обрезка\nНомер [1]: ").strip(), "auto")
+MENU = {"1": ("stream", "auto"), "2": ("stream", "crop"), "3": ("film", "fit"), "4": ("film", "crop")}
+
+
+def ask_mode() -> tuple[str, str, str]:
+    """(тип, режим, ник стримера). Вопросы здесь, а не в cut.bat: cmd ломает UTF-8 bat с кириллицей."""
+    kind, layout = MENU.get(input("1 Стрим (авто), 2 Стрим IRL (обрезка), 3 Фильм: весь кадр, "
+                                  "4 Фильм: обрезка\nНомер [1]: ").strip(), MENU["1"])
+    streamer = input("Ник стримера [из названия]: ").strip() if kind == "stream" else ""
+    return kind, layout, streamer
 
 
 def cmd_cut(args: argparse.Namespace) -> int:
@@ -747,10 +837,10 @@ def cmd_cut(args: argparse.Namespace) -> int:
         return 1
     source, is_file = resolved
     if args.ask:
-        args.layout = ask_layout()
+        args.type, args.layout, args.streamer = ask_mode()
 
     out_dir = config.PREVIEW_DIR / source_id(source, is_file)
-    if make_clips(source, out_dir, args.layout) is None:
+    if make_clips(source, out_dir, args.layout, args.type, args.streamer) is None:
         return 1
     if os.name == "nt":
         os.startfile(out_dir)
@@ -872,12 +962,16 @@ def main() -> int:
     p.set_defaults(func=cmd_process)
     c = sub.add_parser("cut", help="только нарезать в data/preview, без очереди")
     c.add_argument("source", nargs="?", help="путь к видео или ссылка; без него спросит")
-    c.add_argument("--ask", action="store_true", help="спросить режим (для cut.bat)")
+    c.add_argument("--ask", action="store_true", help="спросить тип, режим и ник (для cut.bat)")
     c.set_defaults(func=cmd_cut)
     for s in (p, c):
         s.add_argument("--layout", choices=["auto", "fit", "crop"], default=config.LAYOUT,
                        help=f"auto: раскладка по лицам (стримы), fit: фильм, весь кадр, "
                             f"crop: фильм, обрезка 9:16 по лицам (по умолчанию {config.LAYOUT})")
+        s.add_argument("--type", choices=["stream", "film"], default="stream",
+                       help="стиль заголовков: стрим или фильм (по умолчанию stream)")
+        s.add_argument("--streamer", default="",
+                       help="ник стримера для заголовков; без него модель возьмёт ник из названия")
     sub.add_parser("upload", help="залить pending-клипы в свободные слоты").set_defaults(func=cmd_upload)
     sub.add_parser("status", help="показать очередь").set_defaults(func=cmd_status)
     r = sub.add_parser("retry", help="вернуть failed/unknown в pending")
