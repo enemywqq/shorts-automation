@@ -734,8 +734,8 @@ def make_clips(source: str, out_dir: Path, layout: str, kind: str,
            # Клипы берём из всех кандидатов (highlights), а не из его shorts. Большое --num-clips
            # нужно только затем, чтобы промпт просил у модели больше кандидатов.
            "--num-clips", str(config.CLIPS_MAX[kind]), "--output-json", result_json]
-    if config.LANGUAGE:
-        cmd += ["--language", config.LANGUAGE]
+    if config.LANGUAGE[kind]:
+        cmd += ["--language", config.LANGUAGE[kind]]
     log.info("Генератор: %s", out_dir)
     # Без PYTHONUTF8 вывод генератора в pipe идёт в cp1251, и print заголовка с эмодзи роняет его.
     # LOCAL_SKIP_CROP понимает только патч генератора: без него он ещё и кадрирует сам.
